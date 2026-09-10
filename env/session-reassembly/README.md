@@ -49,6 +49,15 @@
   两通电话的稿号空间天然不相交，稿不可能串；已发的稿同样落在
   SQLite 里，重启后还在。会话视图里的 `latest_draft.changed_since`
   提示活视图相对最近一稿是否已有变化（该出新稿的信号）。
+- **发出去的稿要交给下游签收**：稿一发出就自动进入待签——签收单与稿在
+  同一事务里出生，一稿一张，随稿落 SQLite。按稿号签收；签收单上带稿号、
+  通话、第几稿和签收时间，签完看得出签的是哪一稿。待签期间取出，看到的
+  仍是发稿那一刻的正文和缺口——签收单嵌的就是 drafts 表里那份
+  INSERT-only 的快照，后来补段、重传、会话变新都碰不到它。签收单与稿
+  一对一：没签时又出了新稿，旧待签仍是旧那份，不会被新稿顶掉；同一稿
+  重复签收返回 409，首次签收时间不动。稿号带着 `call_id`，拿一通的号
+  签不到另一通的稿，两通电话的待签和签收不串。重启后没签完的原样还在；
+  老库升级时已有的稿会自动补上待签记录。
 
 ## API
 
@@ -60,6 +69,9 @@ POST /sessions/{call_id}/drafts        把当前视图钉成一稿对外给出�
 GET  /sessions/{call_id}/drafts        该通话已发出的全部稿（按发稿顺序）
 GET  /sessions/{call_id}/drafts/{n}    取该通话的第 n 稿
 GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿
+POST /drafts/{draft_no}/receipt        按稿号签收（201；已签过 409；未知稿号 404）
+GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
+GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -75,6 +87,11 @@ GET  /docs                             Swagger UI
 （截至当时的缺口历史）、`supersedes`（本稿订正的上一稿稿号）、
 `predecessor_had_gaps`/`predecessor_gaps`（上一稿当时是否带缺口、缺在哪）、
 `issued_at`。稿一旦发出即冻结，任何后续片段都不会改变它。
+
+签收单（receipt）关键字段：`draft_no`/`call_id`/`draft_seq`（签的是哪一稿）、
+`status`（`pending` 待签 / `signed` 已签）、`issued_at`（发稿时间）、
+`signed_at`（签收时间，未签为 `null`）、`draft`（当时那一稿的完整快照——
+正文、缺口原样嵌在签收单里，不随后续片段变化）。
 
 ### 示例
 
@@ -116,6 +133,22 @@ curl localhost:8000/drafts/C1-D0001
 # {"status":"incomplete","gaps":[[3,3]],"content":"你好\n听得到吗\n[缺口:片段3]\n那就这样",...}
 ```
 
+### 下游签收
+
+```bash
+# 发出去的稿自动进入待签；下游按稿号签收
+curl -X POST localhost:8000/drafts/C1-D0001/receipt
+# {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,"status":"signed",
+#  "signed_at":"...", "draft":{...当时那一稿...}}
+# 同一稿再签一次 → 409
+
+# 待签时取出，仍是发稿那一刻的正文和缺口；已签的看得出签的是哪一稿
+curl localhost:8000/drafts/C1-D0001/receipt
+
+# 该通话的全部签收单：哪些还欠着、哪些已签
+curl localhost:8000/sessions/C1/receipts
+```
+
 ## 运行
 
 ### Docker
@@ -146,9 +179,10 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           34 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
-                 补齐/大空洞）、旧表迁移、重启持久化，以及已发稿的钉住、
-                 订正链、两通电话隔离、重启后稿不丢
+tests/           43 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+                 补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
+                 两通电话隔离、重启后稿不丢，以及签收（待签钉住、按号签收、
+                 不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单）
 Dockerfile / docker-compose.yml
 ```
 

@@ -7,6 +7,9 @@
     GET  /sessions/{call_id}/drafts        该通话已发出的全部稿（按发稿顺序）
     GET  /sessions/{call_id}/drafts/{n}    取该通话的第 n 稿
     GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿的正文和缺口
+    POST /drafts/{draft_no}/receipt        按稿号签收（同一份不能签两次：409）
+    GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
+    GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
     GET  /healthz                          健康检查
 """
 
@@ -26,7 +29,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.1.0",
+        version="1.2.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -77,6 +80,34 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if draft is None:
             raise HTTPException(status_code=404, detail="unknown draft_no")
         return draft
+
+    @app.post("/drafts/{draft_no}/receipt", status_code=201)
+    def sign_receipt(draft_no: str):
+        """按稿号签收。返回的签收单上带稿号、通话、第几稿和签收时间，
+        看得出签的是哪一稿；同一份不能签两次（409）。"""
+        receipt, created = store.sign_draft(draft_no)
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if not created:
+            raise HTTPException(status_code=409, detail="draft already signed")
+        return receipt
+
+    @app.get("/drafts/{draft_no}/receipt")
+    def get_receipt(draft_no: str):
+        """取一稿的签收单。待签时取出仍是发稿那一刻的正文和缺口 ——
+        后来补段、重传、会话变新都不改这份。"""
+        receipt = store.get_receipt(draft_no)
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return receipt
+
+    @app.get("/sessions/{call_id}/receipts")
+    def list_receipts(call_id: str):
+        """该通话的全部签收单（按发稿顺序）：哪些还欠着、哪些已签。"""
+        receipts = store.list_receipts(call_id)
+        if receipts is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"receipts": receipts}
 
     @app.get("/healthz")
     def healthz():

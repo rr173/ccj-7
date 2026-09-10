@@ -15,6 +15,11 @@
                都不改这一行 —— 拿稿号查到的永远是当时那一稿。新稿用
                supersedes 指向它订正的上一稿，并记下上一稿当时的缺口，
                “订正的是哪一稿、曾经缺过”直接可查。
+- receipts   : 签收单，一稿一张，与稿在同一事务里出生（signed_at 为 NULL
+               即待签）。按稿号签收只把 signed_at 写上一次（UPDATE 带
+               IS NULL 条件，重复签收影响 0 行），同一份签不了两次。
+               签收单本身不复制正文 —— 它引用 drafts 里那份永不修改的
+               快照，所以待签期间取出，看到的仍是发稿那一刻的正文和缺口。
 """
 
 from __future__ import annotations
@@ -70,6 +75,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     issued_at             TEXT NOT NULL,
     UNIQUE (call_id, draft_seq)
 );
+CREATE TABLE IF NOT EXISTS receipts (
+    draft_no   TEXT PRIMARY KEY REFERENCES drafts(draft_no),  -- 一稿一张签收单
+    call_id    TEXT NOT NULL,     -- 这稿属于哪通电话（随稿号，永不可改）
+    created_at TEXT NOT NULL,     -- 进入待签的时刻（= 发稿时间）
+    signed_at  TEXT               -- NULL = 待签；签收时刻，写下后不再改
+);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -96,10 +107,21 @@ class Store:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._migrate_legacy_gap_events()
         self._conn.executescript(SCHEMA)
+        self._backfill_receipts()
         self._lock = threading.RLock()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _backfill_receipts(self) -> None:
+        """老库升级：receipts 表是后加的，已有的稿可能还没有签收单。
+        逐稿补出待签记录（已存在的不动）——“发出去的稿都要签收”对老稿
+        同样成立，重启后没签完的一张不丢。"""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO receipts(draft_no, call_id, created_at)"
+            " SELECT draft_no, call_id, issued_at FROM drafts"
+        )
+        self._conn.commit()
 
     def _migrate_legacy_gap_events(self) -> None:
         """旧库（gap_events 只有 seq 一列）迁移为区间表：
@@ -311,6 +333,7 @@ class Store:
             ).fetchone()
             seq = 1 if prev is None else prev["draft_seq"] + 1
             draft_no = f"{call_id}-D{seq:04d}"
+            now = _now()
             self._conn.execute(
                 "INSERT INTO drafts(draft_no, call_id, draft_seq, status, content,"
                 " parts_json, gaps_json, gap_history_json, was_incomplete,"
@@ -327,8 +350,14 @@ class Store:
                     None if prev is None else prev["draft_no"],
                     0 if prev is None else int(bool(json.loads(prev["gaps_json"]))),
                     "[]" if prev is None else prev["gaps_json"],
-                    _now(),
+                    now,
                 ),
+            )
+            # 稿一发出即进入待签：签收单与稿同一事务出生，不存在“发出去了
+            # 却没进入待签”的中间态。这一张跟着这一稿，之后出新稿也不顶掉它
+            self._conn.execute(
+                "INSERT INTO receipts(draft_no, call_id, created_at) VALUES(?,?,?)",
+                (draft_no, call_id, now),
             )
             return self.get_draft(draft_no)
 
@@ -383,6 +412,70 @@ class Store:
                 (call_id,),
             ).fetchall()
             return [self._row_to_draft(r) for r in rows]
+
+    # ------------------------------------------------------------------ 签收
+
+    def sign_draft(self, draft_no: str) -> tuple[dict | None, bool]:
+        """按稿号签收一稿，返回 (签收单, 是否本次新签)。
+
+        - 未知稿号 → (None, False)；
+        - 已签过 → (签收单, False)：同一份不能签两次，首次签收时间不动；
+        - 首次签收 → (签收单, True)。
+        UPDATE 带 signed_at IS NULL 条件并以影响行数判胜负，并发下也只有
+        一方能签成。稿号本身带着 call_id、一稿一号，拿一通的号永远签不到
+        另一通的稿。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE receipts SET signed_at=?"
+                " WHERE draft_no=? AND signed_at IS NULL",
+                (_now(), draft_no),
+            )
+            receipt = self.get_receipt(draft_no)
+            if receipt is None:
+                return None, False
+            return receipt, cur.rowcount > 0
+
+    @staticmethod
+    def _receipt_view(r: sqlite3.Row, draft: dict) -> dict:
+        return {
+            "draft_no": draft["draft_no"],
+            "call_id": draft["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "status": "signed" if r["signed_at"] else "pending",
+            "issued_at": draft["issued_at"],
+            "signed_at": r["signed_at"],
+            # 当时那一稿的完整快照：正文、缺口……发出即冻结。待签期间后来
+            # 补段、重传、会话变新都碰不到它；签完也看得出签的是哪一稿
+            "draft": draft,
+        }
+
+    def get_receipt(self, draft_no: str) -> dict | None:
+        """按稿号取签收单（待签或已签）。未知稿号返回 None。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT draft_no, signed_at FROM receipts WHERE draft_no=?",
+                (draft_no,),
+            ).fetchone()
+            if r is None:
+                return None
+            return self._receipt_view(r, self.get_draft(r["draft_no"]))
+
+    def list_receipts(self, call_id: str) -> list[dict] | None:
+        """某通电话的全部签收单（按发稿顺序，待签已签都在）。查询本身就
+        带着 call_id，结构上列不出别家的单。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT r.draft_no, r.signed_at FROM receipts r"
+                " JOIN drafts d ON d.draft_no = r.draft_no"
+                " WHERE r.call_id=? ORDER BY d.draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._receipt_view(r, self.get_draft(r["draft_no"])) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对
