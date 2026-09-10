@@ -176,10 +176,12 @@ class Store:
 
             seqs = self._seqs(call_id)
             self._update_gap_events(call_id, seqs, now)
+            had_gap = self._had_gap(call_id)
 
-            # 完整与否只看“到过的序号”：实际到达已连成一片、且越过结束序号，
-            # 才算完整。正文上界（实际最大序号）里只要还夹着缺口，绝不置完成时间。
-            status = R.status_of(seqs, last_seq)
+            # 完整与否只看“到过的序号”：实际到达已连成一片，且（见过结束标记
+            # 越过其序号，或曾经缺过现已补齐）才算完整。正文上界（实际最大序号）
+            # 里只要还夹着缺口，绝不置完成时间。
+            status = R.status_of(seqs, last_seq, had_gap)
             if status == R.COMPLETE:
                 # COALESCE：已经正经完成过，后续重传/越界片段不得挪动完成时间
                 self._conn.execute(
@@ -212,6 +214,12 @@ class Store:
                 (call_id,),
             )
         ]
+
+    def _had_gap(self, call_id: str) -> bool:
+        """这条会话是否曾经出现过缺口（无论后来是否补齐）。"""
+        return self._conn.execute(
+            "SELECT 1 FROM gap_events WHERE call_id=? LIMIT 1", (call_id,)
+        ).fetchone() is not None
 
     def _update_gap_events(self, call_id: str, seqs: set[int], now: str) -> None:
         """当前缺口与 gap_events 对账，全程区间运算：
@@ -295,7 +303,7 @@ class Store:
             ]
             return {
                 "call_id": call_id,
-                "status": R.status_of(seqs, last_seq),
+                "status": R.status_of(seqs, last_seq, bool(gap_history)),
                 "version": len(frags),  # 单调递增，客户端可据此发现视图变了
                 "fragment_count": len(frags),
                 "last_seq": last_seq,
@@ -329,7 +337,7 @@ class Store:
                 out.append(
                     {
                         "call_id": c["call_id"],
-                        "status": R.status_of(seqs, c["last_seq"]),
+                        "status": R.status_of(seqs, c["last_seq"], n_gap_events > 0),
                         "fragment_count": len(seqs),
                         "open_gaps": open_gaps,
                         "was_incomplete": n_gap_events > 0,

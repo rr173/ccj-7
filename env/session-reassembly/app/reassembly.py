@@ -130,19 +130,31 @@ def join_content(parts: list[dict]) -> str:
     return "\n".join(p["text"] if "text" in p else p["marker"] for p in parts)
 
 
-def status_of(seqs: set[int], last_seq: int | None) -> str:
+def status_of(seqs: set[int], last_seq: int | None, had_gap: bool = False) -> str:
     """判定会话状态。宁可报“还在拼/有缺口”，绝不假装完整。
 
     缺口判定以**实际到过的最大序号**为上界：只要更大的号已经到了、中间却空着，
     那就是确凿的缺口，与 is_last 声明在第几号无关 —— 片段越过 is_last 序号
     到达也一样，正文里夹着缺口就绝不能报 complete。
-    结尾片段还在路上（已有序号连续、但还没到 last_seq）不算缺口，仍是 assembling。
+
+    没有缺口时是否完整，两种凭据满足其一即可：
+    - 见过 is_last，且实际到达已越过结束序号（正常收尾）；
+    - **曾经缺过**（对外给过 incomplete）：既然更靠后的片段早就到过、现在缺的
+      那段也补齐了，结尾不可能还藏在后面 —— 缺段补齐即完整，即使结束标记
+      一直没到也不许停在“拼接中”。
+    两者都不满足（连续、没缺过、没见过结束标记）才是 assembling：结尾片段还
+    可能在路上。
     """
     if not seqs:
         return ASSEMBLING
     top = max(seqs)
     if missing_ranges(seqs, top):
         return INCOMPLETE
-    if last_seq is not None and top >= last_seq:
+    # 已声明总数、但实际到达还没越过结束序号：结尾片段还在路上，继续等
+    if last_seq is not None and top < last_seq:
+        return ASSEMBLING
+    # 到过的序号已连成一片：正常收尾（越过结束序号），或曾经缺过、缺段已补齐
+    # （此时更靠后的片段早就到过，结尾不可能还藏在后面）→ 完整
+    if last_seq is not None or had_gap:
         return COMPLETE
     return ASSEMBLING

@@ -113,6 +113,27 @@ def test_gap_filled_later_session_becomes_complete_but_remembers(client):
     assert after["completed_at"] is not None
 
 
+def test_gap_filled_without_ever_seen_end_marker_becomes_complete(client):
+    # 整条会话从没带过 is_last（结束标记丢了/上游没发）：
+    # 对外给出去时是 incomplete，缺段补齐后必须变成 complete，不许停在拼接中
+    post(client, "A", 1, "第一句")
+    post(client, "A", 3, "第三句")
+    assert get(client, "A")["status"] == "incomplete"
+
+    r = post(client, "A", 2, "第二句")
+    s = r["session"]
+    assert s["status"] == "complete"
+    assert s["content"] == "第一句\n第二句\n第三句"
+    assert s["gaps"] == []
+    assert s["was_incomplete"] is True            # 看得出曾经缺过
+    assert s["completed_at"] is not None
+    assert all(h["filled_at"] for h in s["gap_history"])
+
+    listed = [x for x in client.get("/sessions").json()["sessions"]
+              if x["call_id"] == "A"][0]
+    assert listed["status"] == "complete"
+
+
 def test_never_complete_while_content_contains_gap_after_last_seq(client):
     # is_last 早早声明总数，之后越界片段陆续到达、中间还缺号：
     # 哪怕结束标记早就见过，正文夹着缺口就绝不能对外说 complete

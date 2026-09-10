@@ -79,3 +79,13 @@ def test_status_of():
     assert status_of({1, 2, 3}, 2) == COMPLETE            # 同上，越界但连续
     assert status_of(set(), None) == ASSEMBLING
 
+
+def test_status_of_gap_filled_without_end_marker_is_complete():
+    # 从没缺过、也没见过 is_last：还在拼接
+    assert status_of({1, 2}, None) == ASSEMBLING
+    # 曾经缺过（对外给过 incomplete），缺段补齐后即使没见过 is_last 也必须完整
+    assert status_of({1, 2, 3}, None, had_gap=True) == COMPLETE
+    # 已知总数、实际还没到齐且无缺口：结尾片段还在路上，仍是拼接中
+    assert status_of({1, 2, 3}, 5, had_gap=True) == ASSEMBLING
+    assert status_of({1, 2, 4}, None, had_gap=True) == INCOMPLETE  # 还缺着就不算补齐
+
