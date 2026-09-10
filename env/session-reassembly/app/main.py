@@ -9,10 +9,13 @@
     GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿的正文和缺口
     POST /drafts/{draft_no}/receipt        按稿号签收（同一份不能签两次：409）
     GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
+    POST /drafts/{draft_no}/withdrawal     按稿号撤回未签稿（已签/已撤：409；/withdraw 为别名）
+    GET  /drafts/{draft_no}/withdrawal     该稿的撤回记录（未撤回 404）
+    GET  /sessions/{call_id}/withdrawals   该通话已撤回的全部稿
     GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
     POST /drafts/{draft_no}/playback       拿稿号开始回放（已开始则只回到当前进度，不重头）
     GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
-    POST /drafts/{draft_no}/playback/advance  按顺序听下一段：轮到当时的缺口就停住
+    POST /drafts/{draft_no}/playback/advance  按顺序听下一段：轮到缺口或稿已撤回就停住
     GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
     GET  /sessions/{call_id}/late-fragments  该通话的全部迟到片段（按到达顺序，各自补在哪一稿后面）
     GET  /drafts/{draft_no}/late-fragments   补在这一稿后面的迟到片段
@@ -35,7 +38,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.4.0",
+        version="1.5.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -90,11 +93,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/drafts/{draft_no}/receipt", status_code=201)
     def sign_receipt(draft_no: str):
         """按稿号签收。返回的签收单上带稿号、通话、第几稿和签收时间，
-        看得出签的是哪一稿；同一份不能签两次（409）。"""
+        看得出签的是哪一稿；同一份不能签两次，撤过的稿不能再签（409）。"""
         receipt, created = store.sign_draft(draft_no)
         if receipt is None:
             raise HTTPException(status_code=404, detail="unknown draft_no")
         if not created:
+            if receipt["status"] == "withdrawn":
+                raise HTTPException(status_code=409, detail="draft already withdrawn")
             raise HTTPException(status_code=409, detail="draft already signed")
         return receipt
 
@@ -115,6 +120,39 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"receipts": receipts}
 
+    # -------------------------------------------------------------- 撤回
+
+    @app.post("/drafts/{draft_no}/withdrawal", status_code=201)
+    @app.post("/drafts/{draft_no}/withdraw", status_code=201, include_in_schema=False)
+    def withdraw_draft(draft_no: str):
+        """按稿号撤回一份尚未签收的稿。
+
+        撤回不改 drafts 里的正文和缺口；响应与撤回记录仍带整份稿，明确看得出
+        撤的是哪一稿。已签收或已撤回返回 409；未知稿号返回 404。
+        """
+        withdrawal, result = store.withdraw_draft(draft_no)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "already_signed":
+            raise HTTPException(status_code=409, detail="draft already signed")
+        if result == "already_withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
+        return withdrawal
+
+    @app.get("/drafts/{draft_no}/withdrawal")
+    def get_withdrawal(draft_no: str):
+        withdrawal = store.get_withdrawal(draft_no)
+        if withdrawal is None:
+            raise HTTPException(status_code=404, detail="draft not withdrawn")
+        return withdrawal
+
+    @app.get("/sessions/{call_id}/withdrawals")
+    def list_withdrawals(call_id: str):
+        withdrawals = store.list_withdrawals(call_id)
+        if withdrawals is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"withdrawals": withdrawals}
+
     # -------------------------------------------------------------- 回放
 
     @app.post("/drafts/{draft_no}/playback")
@@ -122,12 +160,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         """拿稿号开始听，从这一稿的第 1 个单元顺序往后。
 
         回放读的是发稿那一刻钉死的快照：后来补段不会让它变完整，轮到稿里
-        当时的缺口必须停住。已经开始过则幂等回到当前进度，绝不重头再听。
-        首次开始 201；已存在 200；未知稿号 404。
+        当时的缺口必须停住；稿撤回后也不能再开始。已经开始过且未撤回则幂等
+        回到当前进度，绝不重头再听。
+        首次开始 201；已存在 200；未知稿号 404；已撤回 409。
         """
         playback, started = store.start_playback(draft_no)
         if playback is None:
             raise HTTPException(status_code=404, detail="unknown draft_no")
+        if not started and playback["status"] == "withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
         response.status_code = 201 if started else 200
         return playback
 
@@ -135,9 +176,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def advance_playback(draft_no: str):
         """按顺序听下一个单元。
 
-        轮到正常片段就前进并返回听到的那段；下一个是发稿当时的缺口就停住
-        （status=blocked，位置不动，不跳过）；到末尾 finished。还没开始
-        回放 → 409；未知稿号 → 404。
+        轮到正常片段就前进并返回听到的那段；下一个是发稿当时的缺口、或稿已
+        撤回就停住（status=blocked/withdrawn，位置不动，不跳过）；到末尾
+        finished。还没开始回放 → 409；未知稿号 → 404。
         """
         playback = store.advance_playback(draft_no)
         if playback is None:
@@ -149,7 +190,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/drafts/{draft_no}/playback")
     def get_playback(draft_no: str):
-        """听到哪了。进度落 SQLite，重启后还停在那儿。未开始 409。"""
+        """听到哪了。进度落 SQLite，重启后还停在那儿。稿已撤回显示
+        withdrawn；未开始 409。"""
         playback = store.get_playback(draft_no)
         if playback is None:
             raise HTTPException(status_code=404, detail="unknown draft_no")

@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-七张表：
+八张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -17,7 +17,9 @@
                “订正的是哪一稿、曾经缺过”直接可查。
 - receipts   : 签收单，一稿一张，与稿在同一事务里出生（signed_at 为 NULL
                即待签）。按稿号签收只把 signed_at 写上一次（UPDATE 带
-               IS NULL 条件，重复签收影响 0 行），同一份签不了两次。
+               IS NULL 条件，重复签收影响 0 行），同一份签不了两次。撤回不改
+               本表单：撤过的待签单仍可查，但 sign_draft 会看到 withdrawals
+               并拒绝。已签的稿反过来不能撤回。
                签收单本身不复制正文 —— 它引用 drafts 里那份永不修改的
                快照，所以待签期间取出，看到的仍是发稿那一刻的正文和缺口。
 - playbacks  : 已发稿的回放进度，一稿一条，按**稿号**开始。位置 position
@@ -27,7 +29,14 @@
                （blocked），推进无效、位置不动，绝不跳过去当成听完；后来补
                上的段也不会让这条旧稿的回放突然变完整（要听补齐后的内容得
                另发新稿、另开一条回放）。本表只记录进度，永不写 drafts /
-               receipts —— 回放既不改稿，也不会把待签签掉。
+               receipts —— 回放既不改稿，也不会把待签签掉。稿撤回后本表进度
+               原样冻结，读取状态变 withdrawn，后续推进/重开无效；没开始过的
+               稿撤回后同样不能再开。
+- withdrawals : 撤回记录，一稿至多一条。撤回只往本表写 withdrawn_at，并在
+               读取时把稿标成 withdrawn；drafts 行本身仍 INSERT-only，撤回时
+               的正文、parts、缺口快照一个字不改。已签的稿有 receipts.signed_at
+               保护，不能撤回；撤回后的待签单也不能再签。正在听的稿撤回时，
+               playbacks.position 保持在听到的位置，之后所有推进一律停住。
 - late_fragments : 迟到片段记录 —— 某通电话**已发出至少一稿之后**才新入库
                的片段（内容相同的重传不算，它没带来新东西）。每笔记上片段
                本身和“到达时最新的一稿”，看得出补在哪一稿后面。只往本表
@@ -51,6 +60,7 @@ from . import reassembly as R
 PB_PLAYING = "playing"          # 正在顺序收听，下一个单元是正常片段
 PB_BLOCKED = "blocked"          # 下一个单元是发稿当时的缺口，停住等
 PB_FINISHED = "finished"        # 这一稿快照里的拼装单元已按序听完
+PB_WITHDRAWN = "withdrawn"      # 稿已撤回：进度停在原处，不能再往下听
 PB_NOT_STARTED = "not_started"  # 稿在，但还没拿稿号开始过回放
 
 SCHEMA = """
@@ -111,6 +121,12 @@ CREATE TABLE IF NOT EXISTS playbacks (
     finished_at TEXT              -- 听到快照末尾的时刻；停在缺口时为 NULL
 );
 CREATE INDEX IF NOT EXISTS idx_playbacks_call ON playbacks(call_id);
+CREATE TABLE IF NOT EXISTS withdrawals (
+    draft_no     TEXT PRIMARY KEY REFERENCES drafts(draft_no),  -- 一稿至多撤回一次
+    call_id      TEXT NOT NULL,     -- 随稿号所属通话，按通话隔离都带着它
+    withdrawn_at TEXT NOT NULL      -- 撤回时刻；只新增，不回写 drafts 快照
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_call ON withdrawals(call_id);
 CREATE TABLE IF NOT EXISTS late_fragments (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,  -- 到达顺序
     call_id         TEXT NOT NULL,      -- 属于哪通电话，按通话查/隔离都带着它
@@ -443,16 +459,30 @@ class Store:
             "predecessor_had_gaps": bool(r["predecessor_had_gaps"]),
             "predecessor_gaps": json.loads(r["predecessor_gaps_json"]),
             "issued_at": r["issued_at"],
+            # 撤回状态在读取时叠加；下面两个默认值由 get_draft/list_drafts 补全
+            "is_withdrawn": False,
+            "withdrawn_at": None,
         }
 
+    def _withdrawn_at(self, draft_no: str) -> str | None:
+        r = self._conn.execute(
+            "SELECT withdrawn_at FROM withdrawals WHERE draft_no=?", (draft_no,)
+        ).fetchone()
+        return None if r is None else r["withdrawn_at"]
+
+    def _with_draft_lifecycle(self, draft: dict) -> dict:
+        draft["withdrawn_at"] = self._withdrawn_at(draft["draft_no"])
+        draft["is_withdrawn"] = draft["withdrawn_at"] is not None
+        return draft
+
     def get_draft(self, draft_no: str) -> dict | None:
-        """按稿号取已发稿。只读 drafts 表 —— 这一稿在发出那一刻就钉死了，
+        """按稿号取已发稿。正文来自 drafts 快照；撤回标记来自 withdrawals。
         后来的补段、重传、新稿都不会改变这里返回的正文和缺口。"""
         with self._lock:
             r = self._conn.execute(
                 "SELECT * FROM drafts WHERE draft_no=?", (draft_no,)
             ).fetchone()
-            return None if r is None else self._row_to_draft(r)
+            return None if r is None else self._with_draft_lifecycle(self._row_to_draft(r))
 
     def get_draft_by_seq(self, call_id: str, draft_seq: int) -> dict | None:
         """按“通话 + 第几稿”取稿：查询本身就带着 call_id，结构上不可能
@@ -462,7 +492,7 @@ class Store:
                 "SELECT * FROM drafts WHERE call_id=? AND draft_seq=?",
                 (call_id, draft_seq),
             ).fetchone()
-            return None if r is None else self._row_to_draft(r)
+            return None if r is None else self._with_draft_lifecycle(self._row_to_draft(r))
 
     def list_drafts(self, call_id: str) -> list[dict] | None:
         """某通电话已发出的全部稿（按发稿顺序）。未知 call_id 返回 None。"""
@@ -475,7 +505,88 @@ class Store:
                 "SELECT * FROM drafts WHERE call_id=? ORDER BY draft_seq",
                 (call_id,),
             ).fetchall()
-            return [self._row_to_draft(r) for r in rows]
+            return [self._with_draft_lifecycle(self._row_to_draft(r)) for r in rows]
+
+    # ------------------------------------------------------------------ 撤回
+
+    def withdraw_draft(self, draft_no: str) -> tuple[dict | None, str]:
+        """按稿号撤回一份尚未签收的已发稿。
+
+        返回 (撤回记录, 结果)。结果为：
+        - ``"withdrawn"``：本次撤回成功；
+        - ``"already_withdrawn"``：稿已经撤过，返回原撤回记录，时间不动；
+        - ``"already_signed"``：稿已经签收，拒绝撤回；
+        - ``"unknown"``：稿号不存在，记录为 None。
+
+        撤回只在 withdrawals 插一行：drafts 的正文、parts、缺口、发稿时间全部
+        不 UPDATE；receipts 的待签状态也不删不签。SQLite 外键和稿号中的
+        call_id 共同保证撤的是这一个 draft_no，两通电话不能串号。
+        """
+        with self._lock, self._conn:
+            draft = self._conn.execute(
+                "SELECT call_id FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if draft is None:
+                return None, "unknown"
+
+            existing = self._conn.execute(
+                "SELECT withdrawn_at FROM withdrawals WHERE draft_no=?",
+                (draft_no,),
+            ).fetchone()
+            if existing is not None:
+                return self.get_withdrawal(draft_no), "already_withdrawn"
+
+            signed = self._conn.execute(
+                "SELECT 1 FROM receipts WHERE draft_no=? AND signed_at IS NOT NULL",
+                (draft_no,),
+            ).fetchone()
+            if signed is not None:
+                return self.get_withdrawal(draft_no), "already_signed"
+
+            now = _now()
+            self._conn.execute(
+                "INSERT INTO withdrawals(draft_no, call_id, withdrawn_at)"
+                " VALUES(?,?,?)",
+                (draft_no, draft["call_id"], now),
+            )
+            return self.get_withdrawal(draft_no), "withdrawn"
+
+    def get_withdrawal(self, draft_no: str) -> dict | None:
+        """取一稿的撤回记录；未撤回或稿号未知均返回 None。"""
+        with self._lock:
+            w = self._conn.execute(
+                "SELECT * FROM withdrawals WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if w is None:
+                return None
+            return self._withdrawal_view(w, self.get_draft(w["draft_no"]))
+
+    def list_withdrawals(self, call_id: str) -> list[dict] | None:
+        """某通电话已经撤回的全部稿（按发稿顺序）。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT w.* FROM withdrawals w JOIN drafts d"
+                " ON d.draft_no = w.draft_no"
+                " WHERE w.call_id=? ORDER BY d.draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._withdrawal_view(r, self.get_draft(r["draft_no"])) for r in rows]
+
+    def _withdrawal_view(self, w: sqlite3.Row, draft: dict) -> dict:
+        receipt = self.get_receipt(w["draft_no"])
+        return {
+            "draft_no": w["draft_no"],
+            "call_id": w["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "withdrawn_at": w["withdrawn_at"],
+            # 撤回后仍看得出撤的是哪一稿；draft 是发稿当时冻结的正文和缺口
+            "draft": draft,
+            "receipt_status": receipt["status"] if receipt is not None else None,
+        }
 
     # ------------------------------------------------------------------ 签收
 
@@ -484,12 +595,21 @@ class Store:
 
         - 未知稿号 → (None, False)；
         - 已签过 → (签收单, False)：同一份不能签两次，首次签收时间不动；
+        - 已撤回 → (撤回态签收单, False)：撤过的稿不能再签；
         - 首次签收 → (签收单, True)。
-        UPDATE 带 signed_at IS NULL 条件并以影响行数判胜负，并发下也只有
-        一方能签成。稿号本身带着 call_id、一稿一号，拿一通的号永远签不到
-        另一通的稿。
+
+        UPDATE 带 signed_at IS NULL 条件并以影响行数判胜负；撤回先在同一把
+        锁/事务内判定，已签与已撤互斥。稿号本身带着 call_id、一稿一号，拿一通
+        的号永远签不到另一通的稿。
         """
         with self._lock, self._conn:
+            withdrawn = self._conn.execute(
+                "SELECT 1 FROM withdrawals WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if withdrawn is not None:
+                # 撤回是终态：待签单仍在，但不能把撤过的稿再签出去
+                return self.get_receipt(draft_no), False
+
             cur = self._conn.execute(
                 "UPDATE receipts SET signed_at=?"
                 " WHERE draft_no=? AND signed_at IS NULL",
@@ -506,9 +626,14 @@ class Store:
             "draft_no": draft["draft_no"],
             "call_id": draft["call_id"],
             "draft_seq": draft["draft_seq"],
-            "status": "signed" if r["signed_at"] else "pending",
-            "issued_at": draft["issued_at"],
             "signed_at": r["signed_at"],
+            "withdrawn_at": draft["withdrawn_at"],
+            "is_withdrawn": draft["is_withdrawn"],
+            # 签收与撤回互斥：已签不可撤，撤过不可签；待签且未撤才是 pending
+            "status": "signed" if r["signed_at"] else (
+                "withdrawn" if draft["is_withdrawn"] else "pending"
+            ),
+            "issued_at": draft["issued_at"],
             # 当时那一稿的完整快照：正文、缺口……发出即冻结。待签期间后来
             # 补段、重传、会话变新都碰不到它；签完也看得出签的是哪一稿
             "draft": draft,
@@ -547,12 +672,16 @@ class Store:
         """拿稿号开始（或回到）一条回放，返回 (回放视图, 是否本次新开始)。
 
         位置只在**第一次**开始时建立（position=0）：之后再调只是取出当前
-        进度，绝不会把“听到哪了”拨回开头。未知稿号返回 (None, False)。
+        进度，绝不会把“听到哪了”拨回开头。稿已撤回时不插行、不重开，返回
+        (withdrawn 视图, False)。未知稿号返回 (None, False)。
         """
         with self._lock, self._conn:
             draft = self.get_draft(draft_no)
             if draft is None:
                 return None, False
+            if draft["is_withdrawn"]:
+                # 撤回是终态：即使此前没开始过，也不允许撤后再开一条回放
+                return self.get_playback(draft_no), False
             now = _now()
             cur = self._conn.execute(
                 "INSERT INTO playbacks(draft_no, call_id, position, started_at, updated_at)"
@@ -569,6 +698,7 @@ class Store:
         - 下一个单元是正常片段：position 前进一格，返回该片段（heard）；
         - 下一个单元是**发稿当时的缺口**：停住 —— 不前进、不跳过，状态
           blocked，position 原封不动，updated_at 也不动；
+        - 稿已撤回：停在听到的位置，状态 withdrawn，不前进、不写完成时间；
         - 已到快照末尾：finished，重复推进无效；
         - 还没开始 / 稿号未知：None（由 API 区分 409 / 404）。
         单元列表取自 drafts 表那份永不修改的快照，所以“后来补上的段”
@@ -581,6 +711,11 @@ class Store:
             if pb is None:
                 return None
             draft = self.get_draft(draft_no)  # 只读快照；本方法不写 drafts
+            if draft["is_withdrawn"]:
+                # 撤回到达即停：保留 position，不再推进、不跳过、不写 finished_at
+                return self._playback_view(
+                    self._get_playback_row(draft_no), draft, None
+                )
             parts = draft["parts"]
             pos = pb["position"]
             heard = None
@@ -603,7 +738,9 @@ class Store:
             return self._playback_view(self._get_playback_row(draft_no), draft, heard)
 
     @staticmethod
-    def _playback_state(parts: list[dict], position: int) -> str:
+    def _playback_state(parts: list[dict], position: int, withdrawn: bool = False) -> str:
+        if withdrawn:
+            return PB_WITHDRAWN
         if position >= len(parts):
             return PB_FINISHED
         return PB_BLOCKED if "gap" in parts[position] else PB_PLAYING
@@ -623,7 +760,7 @@ class Store:
             draft = self.get_draft(pb["draft_no"])
         parts = draft["parts"]
         pos = pb["position"]
-        state = self._playback_state(parts, pos)
+        state = self._playback_state(parts, pos, draft["is_withdrawn"])
         view = {
             "draft_no": draft["draft_no"],
             "call_id": draft["call_id"],
@@ -638,7 +775,9 @@ class Store:
             "heard": heard,               # 本次推进刚听到的片段（仅推进响应）
             "draft": draft,               # 发稿那一刻的快照，永不被回放改动
         }
-        if pos < len(parts):
+        if state == PB_WITHDRAWN:
+            view["next"] = None
+        elif pos < len(parts):
             unit = parts[pos]
             if "gap" in unit:
                 # 轮到当时的缺口：明确告诉调用方卡在哪、为什么过不去
@@ -667,7 +806,7 @@ class Store:
                     "draft_no": draft["draft_no"],
                     "call_id": draft["call_id"],
                     "draft_seq": draft["draft_seq"],
-                    "status": PB_NOT_STARTED,
+                    "status": PB_WITHDRAWN if draft["is_withdrawn"] else PB_NOT_STARTED,
                     "position": 0,
                     "total_units": len(draft["parts"]),
                     "started_at": None,
@@ -746,8 +885,10 @@ class Store:
         该稿是否已有变化（正文/状态/缺口任一不同）。变了就意味着对外给的
         那稿已经过时、该出新稿了；内容相同的重传不算变化。"""
         r = self._conn.execute(
-            "SELECT draft_no, issued_at, status, content, gaps_json FROM drafts"
-            " WHERE call_id=? ORDER BY draft_seq DESC LIMIT 1",
+            "SELECT d.draft_no, d.issued_at, d.status, d.content, d.gaps_json,"
+            " w.withdrawn_at FROM drafts d"
+            " LEFT JOIN withdrawals w ON w.draft_no = d.draft_no"
+            " WHERE d.call_id=? ORDER BY d.draft_seq DESC LIMIT 1",
             (call_id,),
         ).fetchone()
         if r is None:
@@ -760,6 +901,8 @@ class Store:
         return {
             "draft_no": r["draft_no"],
             "issued_at": r["issued_at"],
+            "withdrawn_at": r["withdrawn_at"],
+            "is_withdrawn": r["withdrawn_at"] is not None,
             "changed_since": changed,
         }
 
@@ -840,6 +983,10 @@ class Store:
                     "SELECT COUNT(*) AS n FROM drafts WHERE call_id=?",
                     (c["call_id"],),
                 ).fetchone()["n"]
+                n_withdrawn = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM withdrawals WHERE call_id=?",
+                    (c["call_id"],),
+                ).fetchone()["n"]
                 out.append(
                     {
                         "call_id": c["call_id"],
@@ -849,6 +996,7 @@ class Store:
                         "was_incomplete": n_gap_events > 0,
                         "conflicts": c["conflicts"],
                         "drafts_issued": n_drafts,
+                        "drafts_withdrawn": n_withdrawn,
                         "first_seen_at": c["first_seen_at"],
                         "last_activity_at": c["last_activity_at"],
                         "completed_at": c["completed_at"],

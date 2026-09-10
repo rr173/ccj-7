@@ -69,6 +69,15 @@
   稿号自带 `call_id`，按通话列出（`GET /sessions/{call_id}/playbacks`）
   也带 `call_id` 过滤，两通电话的回放物理上不串。回放代码路径只写新的
   `playbacks` 表、只读 `drafts`：**不把稿改掉，也不把待签签掉**。
+- **未签收的已发稿可以按稿号撤回**：`POST /drafts/{稿号}/withdrawal` 按
+  稿号撤回。撤回只新增一条 `withdrawals` 记录，不 UPDATE `drafts`：那一稿
+  当时的正文、拼装单元、缺口和发稿时间仍原样可查；撤回记录和稿上的
+  `is_withdrawn=true`、`withdrawn_at` 都带稿号、通话和第几稿，撤完看得出
+  撤的是哪一份。签收与撤回互斥：**已经签过的不能撤，撤回后的未签稿不能再
+  签**。正在听的稿撤回后，`playbacks.position` 停在听到的位置，状态变
+  `withdrawn`，之后不能继续推进，也不能重新开始；没开始过的稿撤回后同样
+  不能再开。稿号自带 `call_id`，全局稿号操作也撤不到另一通电话；撤回记录
+  落 SQLite，重启后仍是终态。
 - **稿发出后才到的段单独记迟到**：某通电话发出至少一稿后，新入库的片段
   （内容相同的重传不算——它没带来新东西）会单独记进迟到记录，挂上到达
   时最新的一稿，看得出补在哪一稿后面；接收响应里 `ingest.late=true`
@@ -91,6 +100,9 @@ GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当
 POST /drafts/{draft_no}/receipt        按稿号签收（201；已签过 409；未知稿号 404）
 GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
 GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
+POST /drafts/{draft_no}/withdrawal     按稿号撤回未签稿（/withdraw 为别名；201；已签/已撤 409；未知稿号 404）
+GET  /drafts/{draft_no}/withdrawal     这一稿的撤回记录（未撤回 404）
+GET  /sessions/{call_id}/withdrawals   该通话已撤回的全部稿（按发稿顺序）
 POST /drafts/{draft_no}/playback       拿稿号开始回放（首次 201；已开始 200 且只回当前进度）
 GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
 POST /drafts/{draft_no}/playback/advance  按顺序听下一段（blocked 时位置不动）
@@ -111,21 +123,29 @@ GET  /docs                             Swagger UI
 `status`/`content`/`gaps`（发稿那一刻的状态、正文、缺口）、`gap_history`
 （截至当时的缺口历史）、`supersedes`（本稿订正的上一稿稿号）、
 `predecessor_had_gaps`/`predecessor_gaps`（上一稿当时是否带缺口、缺在哪）、
-`issued_at`。稿一旦发出即冻结，任何后续片段都不会改变它。
+`issued_at`、`is_withdrawn`/`withdrawn_at`（是否撤回、撤回时刻）。稿一旦
+发出即冻结，撤回只叠加状态，任何后续片段或撤回动作都不会改变其正文和缺口。
 
 签收单（receipt）关键字段：`draft_no`/`call_id`/`draft_seq`（签的是哪一稿）、
-`status`（`pending` 待签 / `signed` 已签）、`issued_at`（发稿时间）、
-`signed_at`（签收时间，未签为 `null`）、`draft`（当时那一稿的完整快照——
+`status`（`pending` 待签 / `signed` 已签 / `withdrawn` 已撤回）、
+`issued_at`（发稿时间）、`signed_at`（签收时间，未签为 `null`）、
+`withdrawn_at`（撤回时间，未撤为 `null`）、`draft`（当时那一稿的完整快照——
 正文、缺口原样嵌在签收单里，不随后续片段变化）。
 
 回放（playback）关键字段：`draft_no`/`call_id`/`draft_seq`（听的是哪稿）、
 `status`（`playing` 下一段是正常片段 / `blocked` 轮到发稿当时的缺口、停住 /
-`finished` 这稿快照已按序听完 / `not_started` 还没拿稿号开始）、`position`
+`finished` 这稿快照已按序听完 / `withdrawn` 稿已撤回、听到哪停在哪 /
+`not_started` 还没拿稿号开始）、`position`
 （已听到第几个拼装单元，下次从这里继续）、`total_units`、`next`（下一个单元：
 正常片段为 `{seq,text}`，缺口为 `{gap:[lo,hi],marker}`，末尾为 `null`）、
 `heard`（仅推进响应：本次刚听到的片段；停在缺口或已听完为 `null`）、
 `started_at`/`updated_at`/`finished_at`、`draft`（回放所基于的当时那稿快照）。
 回放只新增 `playbacks` 进度，从不修改 `drafts`，也不触碰 `receipts`。
+
+撤回记录（withdrawal）关键字段：`draft_no`/`call_id`/`draft_seq`（撤的是哪稿）、
+`withdrawn_at`（撤回时刻）、`receipt_status`（撤回时的终态，通常为 `withdrawn`）、
+`draft`（发稿当时完整快照）。撤回不删除稿或签收单，只让该稿进入不可签、
+不可继续听的终态。
 
 迟到片段（late fragment）关键字段：`call_id`、`seq`、`text`（到达时的原文）、
 `after_draft_no`/`after_draft_seq`（补在哪一稿后面——到达那一刻该通话最新的
@@ -187,6 +207,28 @@ curl localhost:8000/drafts/C1-D0001/receipt
 
 # 该通话的全部签收单：哪些还欠着、哪些已签
 curl localhost:8000/sessions/C1/receipts
+```
+
+### 撤回未签收稿
+
+```bash
+# C1-D0001 未签，拿稿号撤回；响应里仍带完整快照，看得出撤的是哪一稿
+curl -X POST localhost:8000/drafts/C1-D0001/withdrawal
+# {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,
+#  "withdrawn_at":"...","receipt_status":"withdrawn","draft":{...当时那稿...}}
+
+# 再查稿会带撤回标记，但正文和缺口仍是发稿时的样子
+curl localhost:8000/drafts/C1-D0001
+# {"is_withdrawn":true,"withdrawn_at":"...","content":"...原样...","gaps":[...]}
+
+# 撤过不能再签；已签过的稿反过来不能撤
+curl -X POST localhost:8000/drafts/C1-D0001/receipt        # 409
+curl localhost:8000/drafts/C1-D0001/withdrawal            # 撤回记录
+curl localhost:8000/sessions/C1/withdrawals               # 按通话列出撤回
+
+# 正在听到一半撤回：回放 position 停住，之后推进/重开都是 withdrawn
+curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
+# {"status":"withdrawn","position":1,"next":null,...}
 ```
 
 ### 按顺序听回去
@@ -273,12 +315,14 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           59 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           69 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
                  回放（顺序收听、缺口停住不跳过、补段不让旧稿变完整、
                  新旧稿两条回放独立、两通电话不串、重启停在原处、不改稿不签收），
+                 撤回（按号撤回、快照不改正文缺口、已签不可撤、撤后不可签、
+                 正在听停在原处、两通电话不串、重启后仍是撤回态），
                  以及迟到片段（单独记录、看得出补在哪一稿后面、不改稿不动待签
                  不让回放突然听完、两通电话不串、重启后记录还在）
 Dockerfile / docker-compose.yml
