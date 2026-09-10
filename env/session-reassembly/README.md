@@ -39,21 +39,42 @@
   `[2, 9999999999]`，写入、查询、列表都在毫秒级，且立刻看得出缺着。
 - **重启不散**：全部状态在 SQLite（WAL + `synchronous=FULL`），视图由
   片段表现算，进程重启、容器重建后会话原样恢复，可继续拼接。
+- **对外给出的稿钉住不动**：`GET /sessions/{call_id}` 永远是最新样子，
+  所以"对外给出"是一个显式动作——`POST /sessions/{call_id}/drafts`
+  把**那一刻**的正文、缺口、状态整体快照成一稿，发出稿号
+  （如 `C1-D0001`）。稿表只插不改：之后补段、重传、再发新稿都不动
+  这一稿，拿稿号查到的永远是当时那份正文和缺口。缺口补上后再发一稿，
+  新稿自带 `supersedes`（订正的是哪一稿）和 `predecessor_gaps`
+  （上一稿当时缺在哪），"曾经缺过"直接可查。稿号带着 `call_id`，
+  两通电话的稿号空间天然不相交，稿不可能串；已发的稿同样落在
+  SQLite 里，重启后还在。会话视图里的 `latest_draft.changed_since`
+  提示活视图相对最近一稿是否已有变化（该出新稿的信号）。
 
 ## API
 
 ```
-POST /fragments            接收片段，返回 {ingest, session} 当前视图
-GET  /sessions             所有会话摘要
-GET  /sessions/{call_id}   单个会话完整视图（不存在返回 404）
-GET  /healthz              健康检查
-GET  /docs                 Swagger UI
+POST /fragments                        接收片段，返回 {ingest, session} 当前视图
+GET  /sessions                         所有会话摘要
+GET  /sessions/{call_id}               单个会话完整视图（不存在返回 404）—— 永远是最新样子
+POST /sessions/{call_id}/drafts        把当前视图钉成一稿对外给出，返回稿号（201）
+GET  /sessions/{call_id}/drafts        该通话已发出的全部稿（按发稿顺序）
+GET  /sessions/{call_id}/drafts/{n}    取该通话的第 n 稿
+GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿
+GET  /healthz                          健康检查
+GET  /docs                             Swagger UI
 ```
 
 会话视图关键字段：`status`、`content`（拼好的文本，一行一片段）、
 `gaps`（当前缺口区间列表，如 `[[2,4]]`）、`was_incomplete`、`gap_history`
 （每项含 `range`/`detected_at`/`filled_at`）、`version`、
-`retransmissions`、`conflicts`、`completed_at`。
+`retransmissions`、`conflicts`、`completed_at`、`latest_draft`
+（最近一稿的 `draft_no`/`issued_at`/`changed_since`，未发过稿为 `null`）。
+
+稿（draft）关键字段：`draft_no`（稿号）、`draft_seq`（该通话第几稿）、
+`status`/`content`/`gaps`（发稿那一刻的状态、正文、缺口）、`gap_history`
+（截至当时的缺口历史）、`supersedes`（本稿订正的上一稿稿号）、
+`predecessor_had_gaps`/`predecessor_gaps`（上一稿当时是否带缺口、缺在哪）、
+`issued_at`。稿一旦发出即冻结，任何后续片段都不会改变它。
 
 ### 示例
 
@@ -76,6 +97,23 @@ curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
 # 补上缺口 → 同一条会话变 complete，was_incomplete=true
 curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
      -d '{"call_id":"C1","seq":3,"text":"信号不太好"}'
+```
+
+### 对外给出与订正
+
+```bash
+# 缺第 3 段时就得先对外给一版 → 钉成 C1-D0001（正文含 [缺口:片段3]）
+curl -X POST localhost:8000/sessions/C1/drafts
+# {"draft_no":"C1-D0001","status":"incomplete","gaps":[[3,3]],...}
+
+# 缺口补上后出新稿 → C1-D0002，看得出订正的是哪一稿、上一稿曾缺在哪
+curl -X POST localhost:8000/sessions/C1/drafts
+# {"draft_no":"C1-D0002","status":"complete","supersedes":"C1-D0001",
+#  "predecessor_had_gaps":true,"predecessor_gaps":[[3,3]],...}
+
+# 之后任何时候拿旧稿号，拿到的仍是当时那一稿的正文和缺口
+curl localhost:8000/drafts/C1-D0001
+# {"status":"incomplete","gaps":[[3,3]],"content":"你好\n听得到吗\n[缺口:片段3]\n那就这样",...}
 ```
 
 ## 运行
@@ -108,8 +146,9 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           25 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
-                 补齐/大空洞）、旧表迁移、重启持久化
+tests/           34 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+                 补齐/大空洞）、旧表迁移、重启持久化，以及已发稿的钉住、
+                 订正链、两通电话隔离、重启后稿不丢
 Dockerfile / docker-compose.yml
 ```
 

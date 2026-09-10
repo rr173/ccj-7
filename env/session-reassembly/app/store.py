@@ -3,17 +3,23 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-三张表：
+四张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
                写新行，补齐时填 filled_at，永不删除。区间存储保证序号空一
                大截时也只有几行、几次运算，不会逐号展开卡死。
                用来回答“这条会话曾经缺过吗”。
+- drafts     : 已对外给出的稿，**INSERT-only**。发稿那一刻把正文、缺口、
+               状态整体快照进来并分配稿号，之后任何补段、重传、再发新稿
+               都不改这一行 —— 拿稿号查到的永远是当时那一稿。新稿用
+               supersedes 指向它订正的上一稿，并记下上一稿当时的缺口，
+               “订正的是哪一稿、曾经缺过”直接可查。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -45,6 +51,24 @@ CREATE TABLE IF NOT EXISTS gap_events (
     detected_at TEXT NOT NULL,
     filled_at   TEXT,
     PRIMARY KEY (call_id, seq_lo, seq_hi)
+);
+CREATE TABLE IF NOT EXISTS drafts (
+    draft_no              TEXT PRIMARY KEY,  -- 稿号：{call_id}-D{序号}，全局唯一
+    call_id               TEXT NOT NULL,     -- 这一稿属于哪通电话，永不可改
+    draft_seq             INTEGER NOT NULL,  -- 该通话内第几稿，从 1 递增
+    status                TEXT NOT NULL,     -- 发稿那一刻的会话状态
+    content               TEXT NOT NULL,     -- 钉住的正文（含当时的缺口标记）
+    parts_json            TEXT NOT NULL,     -- 拼装单元快照
+    gaps_json             TEXT NOT NULL,     -- 发稿那一刻的缺口区间
+    gap_history_json      TEXT NOT NULL,     -- 截至发稿的缺口历史（当时的样子）
+    was_incomplete        INTEGER NOT NULL,
+    fragment_count        INTEGER NOT NULL,
+    version               INTEGER NOT NULL,  -- 发稿时活视图的版本号
+    supersedes            TEXT,              -- 本稿订正的上一稿稿号（首稿为 NULL）
+    predecessor_had_gaps  INTEGER NOT NULL DEFAULT 0,  -- 上一稿当时是否带缺口
+    predecessor_gaps_json TEXT NOT NULL DEFAULT '[]',  -- 上一稿当时的缺口区间
+    issued_at             TEXT NOT NULL,
+    UNIQUE (call_id, draft_seq)
 );
 """
 
@@ -265,6 +289,123 @@ class Store:
                 (call_id, lo, hi, now),
             )
 
+    # ------------------------------------------------------------------ 发稿
+
+    def issue_draft(self, call_id: str) -> dict | None:
+        """把当前视图钉成一稿：分配稿号、落一份**永不修改**的快照。
+
+        稿号形如 `{call_id}-D0001`：稿号本身带着通话标识，不同通话的稿号
+        空间天然不相交，两通电话的稿不可能串。新稿记录它订正的上一稿
+        （supersedes）以及上一稿当时的缺口（predecessor_gaps）——缺口
+        补上后出的新稿，一眼能看出订正的是哪一稿、曾经缺过。
+        未知 call_id 返回 None。
+        """
+        with self._lock, self._conn:  # 取视图 + 写快照一个事务，不落半截
+            view = self.get_session(call_id)
+            if view is None:
+                return None
+            prev = self._conn.execute(
+                "SELECT draft_no, draft_seq, gaps_json FROM drafts"
+                " WHERE call_id=? ORDER BY draft_seq DESC LIMIT 1",
+                (call_id,),
+            ).fetchone()
+            seq = 1 if prev is None else prev["draft_seq"] + 1
+            draft_no = f"{call_id}-D{seq:04d}"
+            self._conn.execute(
+                "INSERT INTO drafts(draft_no, call_id, draft_seq, status, content,"
+                " parts_json, gaps_json, gap_history_json, was_incomplete,"
+                " fragment_count, version, supersedes, predecessor_had_gaps,"
+                " predecessor_gaps_json, issued_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    draft_no, call_id, seq, view["status"], view["content"],
+                    json.dumps(view["parts"], ensure_ascii=False),
+                    json.dumps(view["gaps"]),
+                    json.dumps(view["gap_history"], ensure_ascii=False),
+                    int(view["was_incomplete"]),
+                    view["fragment_count"], view["version"],
+                    None if prev is None else prev["draft_no"],
+                    0 if prev is None else int(bool(json.loads(prev["gaps_json"]))),
+                    "[]" if prev is None else prev["gaps_json"],
+                    _now(),
+                ),
+            )
+            return self.get_draft(draft_no)
+
+    @staticmethod
+    def _row_to_draft(r: sqlite3.Row) -> dict:
+        return {
+            "draft_no": r["draft_no"],
+            "call_id": r["call_id"],
+            "draft_seq": r["draft_seq"],
+            "status": r["status"],
+            "content": r["content"],
+            "parts": json.loads(r["parts_json"]),
+            "gaps": json.loads(r["gaps_json"]),
+            "gap_history": json.loads(r["gap_history_json"]),
+            "was_incomplete": bool(r["was_incomplete"]),
+            "fragment_count": r["fragment_count"],
+            "version": r["version"],
+            "supersedes": r["supersedes"],
+            "predecessor_had_gaps": bool(r["predecessor_had_gaps"]),
+            "predecessor_gaps": json.loads(r["predecessor_gaps_json"]),
+            "issued_at": r["issued_at"],
+        }
+
+    def get_draft(self, draft_no: str) -> dict | None:
+        """按稿号取已发稿。只读 drafts 表 —— 这一稿在发出那一刻就钉死了，
+        后来的补段、重传、新稿都不会改变这里返回的正文和缺口。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            return None if r is None else self._row_to_draft(r)
+
+    def get_draft_by_seq(self, call_id: str, draft_seq: int) -> dict | None:
+        """按“通话 + 第几稿”取稿：查询本身就带着 call_id，结构上不可能
+        拿到另一通电话的稿。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM drafts WHERE call_id=? AND draft_seq=?",
+                (call_id, draft_seq),
+            ).fetchone()
+            return None if r is None else self._row_to_draft(r)
+
+    def list_drafts(self, call_id: str) -> list[dict] | None:
+        """某通电话已发出的全部稿（按发稿顺序）。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM drafts WHERE call_id=? ORDER BY draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._row_to_draft(r) for r in rows]
+
+    def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
+        """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对
+        该稿是否已有变化（正文/状态/缺口任一不同）。变了就意味着对外给的
+        那稿已经过时、该出新稿了；内容相同的重传不算变化。"""
+        r = self._conn.execute(
+            "SELECT draft_no, issued_at, status, content, gaps_json FROM drafts"
+            " WHERE call_id=? ORDER BY draft_seq DESC LIMIT 1",
+            (call_id,),
+        ).fetchone()
+        if r is None:
+            return None
+        changed = (
+            r["status"] != view["status"]
+            or r["content"] != view["content"]
+            or json.loads(r["gaps_json"]) != view["gaps"]
+        )
+        return {
+            "draft_no": r["draft_no"],
+            "issued_at": r["issued_at"],
+            "changed_since": changed,
+        }
+
     # ------------------------------------------------------------------ 读取
 
     def get_session(self, call_id: str) -> dict | None:
@@ -301,7 +442,7 @@ class Store:
                     (call_id,),
                 )
             ]
-            return {
+            view = {
                 "call_id": call_id,
                 "status": R.status_of(seqs, last_seq, bool(gap_history)),
                 "version": len(frags),  # 单调递增，客户端可据此发现视图变了
@@ -318,6 +459,10 @@ class Store:
                 "last_activity_at": call["last_activity_at"],
                 "completed_at": call["completed_at"],
             }
+            # 最近发出的一稿 + 活视图相对它是否已变（该出新稿的信号）；
+            # 没发过稿为 None
+            view["latest_draft"] = self._latest_draft_info(call_id, view)
+            return view
 
     def list_sessions(self) -> list[dict]:
         """所有会话的摘要列表（含拼接中、含缺口、已完成）。"""
@@ -334,6 +479,10 @@ class Store:
                     "SELECT COUNT(*) AS n FROM gap_events WHERE call_id=?",
                     (c["call_id"],),
                 ).fetchone()["n"]
+                n_drafts = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM drafts WHERE call_id=?",
+                    (c["call_id"],),
+                ).fetchone()["n"]
                 out.append(
                     {
                         "call_id": c["call_id"],
@@ -342,6 +491,7 @@ class Store:
                         "open_gaps": open_gaps,
                         "was_incomplete": n_gap_events > 0,
                         "conflicts": c["conflicts"],
+                        "drafts_issued": n_drafts,
                         "first_seen_at": c["first_seen_at"],
                         "last_activity_at": c["last_activity_at"],
                         "completed_at": c["completed_at"],
