@@ -1,0 +1,11 @@
+services:
+  reassembly:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - reassembly-data:/data   # SQLite 落在卷里，容器重建/重启不丢会话
+    restart: unless-stopped
+
+volumes:
+  reassembly-data:
