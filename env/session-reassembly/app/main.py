@@ -19,7 +19,13 @@
     GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
     GET  /sessions/{call_id}/late-fragments  该通话的全部迟到片段（按到达顺序，各自补在哪一稿后面）
     GET  /drafts/{draft_no}/late-fragments   补在这一稿后面的迟到片段
-    GET  /healthz                          健康检查
+    POST /drafts/{draft_no}/claim            按稿号认领（首次 201；本人重复认领 200；别人已认领 409）
+    POST /drafts/{draft_no}/claim/release    把当前认领交出去，之后才能换人认（未认领 409）
+    GET  /drafts/{draft_no}/claim            这一稿现在谁认着（含历次认领/交出记录）
+    GET  /sessions/{call_id}/claims          该通话全部稿的认领状态（按发稿顺序）
+    GET  /healthz                            健康检查
+
+    发出去的稿要先有人认领：没认领的稿不能签收、不能回放、也不能撤回（409）。
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Response
 
-from .models import FragmentIn
+from .models import ClaimIn, FragmentIn
 from .store import Store
 
 
@@ -38,7 +44,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.5.0",
+        version="1.6.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -93,13 +99,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/drafts/{draft_no}/receipt", status_code=201)
     def sign_receipt(draft_no: str):
         """按稿号签收。返回的签收单上带稿号、通话、第几稿和签收时间，
-        看得出签的是哪一稿；同一份不能签两次，撤过的稿不能再签（409）。"""
-        receipt, created = store.sign_draft(draft_no)
-        if receipt is None:
+        看得出签的是哪一稿；同一份不能签两次，撤过的稿不能再签（409）。
+        稿要先有人认领：没认领的稿不能签（409）。"""
+        receipt, result = store.sign_draft(draft_no)
+        if result == "unknown":
             raise HTTPException(status_code=404, detail="unknown draft_no")
-        if not created:
-            if receipt["status"] == "withdrawn":
-                raise HTTPException(status_code=409, detail="draft already withdrawn")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        if result == "already_withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
+        if result == "already_signed":
             raise HTTPException(status_code=409, detail="draft already signed")
         return receipt
 
@@ -129,10 +138,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         撤回不改 drafts 里的正文和缺口；响应与撤回记录仍带整份稿，明确看得出
         撤的是哪一稿。已签收或已撤回返回 409；未知稿号返回 404。
+        稿要先有人认领：没认领的稿不能撤（409）。
         """
         withdrawal, result = store.withdraw_draft(draft_no)
         if result == "unknown":
             raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
         if result == "already_signed":
             raise HTTPException(status_code=409, detail="draft already signed")
         if result == "already_withdrawn":
@@ -161,15 +173,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         回放读的是发稿那一刻钉死的快照：后来补段不会让它变完整，轮到稿里
         当时的缺口必须停住；稿撤回后也不能再开始。已经开始过且未撤回则幂等
-        回到当前进度，绝不重头再听。
-        首次开始 201；已存在 200；未知稿号 404；已撤回 409。
+        回到当前进度，绝不重头再听。稿要先有人认领：没认领的稿不能听（409）。
+        首次开始 201；已存在 200；未知稿号 404；已撤回/未认领 409。
         """
-        playback, started = store.start_playback(draft_no)
-        if playback is None:
+        playback, result = store.start_playback(draft_no)
+        if result == "unknown":
             raise HTTPException(status_code=404, detail="unknown draft_no")
-        if not started and playback["status"] == "withdrawn":
+        if result == "withdrawn":
             raise HTTPException(status_code=409, detail="draft already withdrawn")
-        response.status_code = 201 if started else 200
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        response.status_code = 201 if result == "started" else 200
         return playback
 
     @app.post("/drafts/{draft_no}/playback/advance")
@@ -207,6 +221,53 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if playbacks is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"playbacks": playbacks}
+
+    # -------------------------------------------------------------- 认领
+
+    @app.post("/drafts/{draft_no}/claim")
+    def claim_draft(draft_no: str, body: ClaimIn, response: Response):
+        """按稿号认领一稿。发出去的稿要先有人认领：没认领不能签收、
+        不能回放、也不能撤回。一个人认了，别人不能再认走（409）——
+        得等当前认领人把它交出去。本人重复认领幂等（200，时间不动）。
+        认领只记“谁认的”，不改那一稿当时的正文和缺口。
+        首次认领 201；本人重复 200；别人已认领 409；未知稿号 404。"""
+        claim, result = store.claim_draft(draft_no, body.claimed_by)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "already_held":
+            raise HTTPException(status_code=409, detail="draft already claimed")
+        response.status_code = 201 if result == "claimed" else 200
+        return claim
+
+    @app.post("/drafts/{draft_no}/claim/release")
+    def release_claim(draft_no: str):
+        """把当前认领交出去。交出去之后别人才能认领这一稿；交出后、
+        还没人认领期间，这稿同样不能签、不能听、不能撤。
+        交出 200；当前没人认领 409；未知稿号 404。"""
+        claim, result = store.release_claim(draft_no)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        return claim
+
+    @app.get("/drafts/{draft_no}/claim")
+    def get_claim(draft_no: str):
+        """这一稿现在谁认着（含历次认领/交出记录）。稿快照原样嵌在里面 ——
+        认领来认领去，当时那一稿的正文和缺口一个字不变。"""
+        claim = store.get_claim(draft_no)
+        if claim is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return claim
+
+    @app.get("/sessions/{call_id}/claims")
+    def list_claims(call_id: str):
+        """该通话全部稿的认领状态（按发稿顺序）。查询带 call_id，
+        结构上列不出另一通电话的认领。"""
+        claims = store.list_claims(call_id)
+        if claims is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"claims": claims}
 
     # -------------------------------------------------------------- 迟到片段
 

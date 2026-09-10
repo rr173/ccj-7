@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-八张表：
+九张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -44,6 +44,13 @@
                不了已发的稿、动不了待签，也没法让停在缺口上的回放突然听完。
                记录按 call_id 归组、落在 SQLite 里：两通电话的迟到记录不
                串，重启后还在。
+- claims     : 认领记录 —— 发出去的稿要先有人认领，没认领不能签收、不能
+               回放、也不能撤回。一稿同一时刻至多一条未交出的认领
+               （released_at 为 NULL 即当前持有中）：一个人认了，别人不能
+               再认走；交出去（填 released_at）之后才换别人认。每次认领/
+               交出只往本表插行或填 released_at，绝不碰 drafts —— 认领改
+               不了那一稿当时的正文和缺口。稿号自带 call_id，拿一通的号认
+               不到另一通的稿；记录落 SQLite，重启后认了谁还在。
 """
 
 from __future__ import annotations
@@ -138,6 +145,16 @@ CREATE TABLE IF NOT EXISTS late_fragments (
 );
 CREATE INDEX IF NOT EXISTS idx_late_call ON late_fragments(call_id);
 CREATE INDEX IF NOT EXISTS idx_late_draft ON late_fragments(after_draft_no);
+CREATE TABLE IF NOT EXISTS claims (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 认领顺序
+    draft_no    TEXT NOT NULL REFERENCES drafts(draft_no),  -- 认的是哪一稿
+    call_id     TEXT NOT NULL,      -- 随稿号所属通话，按通话隔离都带着它
+    claimed_by  TEXT NOT NULL,      -- 谁认的
+    claimed_at  TEXT NOT NULL,      -- 认领时刻
+    released_at TEXT                -- NULL = 当前持有中；交出去的时刻
+);
+CREATE INDEX IF NOT EXISTS idx_claims_draft ON claims(draft_no);
+CREATE INDEX IF NOT EXISTS idx_claims_call ON claims(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -516,6 +533,7 @@ class Store:
         - ``"withdrawn"``：本次撤回成功；
         - ``"already_withdrawn"``：稿已经撤过，返回原撤回记录，时间不动；
         - ``"already_signed"``：稿已经签收，拒绝撤回；
+        - ``"not_claimed"``：还没人认领 —— 没认领的稿不能撤；
         - ``"unknown"``：稿号不存在，记录为 None。
 
         撤回只在 withdrawals 插一行：drafts 的正文、parts、缺口、发稿时间全部
@@ -542,6 +560,10 @@ class Store:
             ).fetchone()
             if signed is not None:
                 return self.get_withdrawal(draft_no), "already_signed"
+
+            if not self._is_claimed(draft_no):
+                # 没认领不能撤：稿和待签都原样不动，等有人认领后再撤
+                return None, "not_claimed"
 
             now = _now()
             self._conn.execute(
@@ -590,35 +612,41 @@ class Store:
 
     # ------------------------------------------------------------------ 签收
 
-    def sign_draft(self, draft_no: str) -> tuple[dict | None, bool]:
-        """按稿号签收一稿，返回 (签收单, 是否本次新签)。
+    def sign_draft(self, draft_no: str) -> tuple[dict | None, str]:
+        """按稿号签收一稿，返回 (签收单, 结果)。结果为：
 
-        - 未知稿号 → (None, False)；
-        - 已签过 → (签收单, False)：同一份不能签两次，首次签收时间不动；
-        - 已撤回 → (撤回态签收单, False)：撤过的稿不能再签；
-        - 首次签收 → (签收单, True)。
+        - ``"signed"``：本次新签；
+        - ``"already_signed"``：已签过 —— 同一份不能签两次，首次签收时间不动；
+        - ``"already_withdrawn"``：已撤回 —— 撤过的稿不能再签；
+        - ``"not_claimed"``：还没人认领 —— 没认领的稿不能签；
+        - ``"unknown"``：稿号不存在，签收单为 None。
 
-        UPDATE 带 signed_at IS NULL 条件并以影响行数判胜负；撤回先在同一把
-        锁/事务内判定，已签与已撤互斥。稿号本身带着 call_id、一稿一号，拿一通
-        的号永远签不到另一通的稿。
+        UPDATE 带 signed_at IS NULL 条件并以影响行数判胜负；撤回与认领先在
+        同一把锁/事务内判定，已签与已撤互斥。稿号本身带着 call_id、一稿一号，
+        拿一通的号永远签不到另一通的稿。
         """
         with self._lock, self._conn:
+            receipt = self.get_receipt(draft_no)
+            if receipt is None:
+                return None, "unknown"
+            if not self._is_claimed(draft_no):
+                # 没认领不能签：待签单原样欠着，等有人认领后再签
+                return receipt, "not_claimed"
             withdrawn = self._conn.execute(
                 "SELECT 1 FROM withdrawals WHERE draft_no=?", (draft_no,)
             ).fetchone()
             if withdrawn is not None:
                 # 撤回是终态：待签单仍在，但不能把撤过的稿再签出去
-                return self.get_receipt(draft_no), False
+                return receipt, "already_withdrawn"
 
             cur = self._conn.execute(
                 "UPDATE receipts SET signed_at=?"
                 " WHERE draft_no=? AND signed_at IS NULL",
                 (_now(), draft_no),
             )
-            receipt = self.get_receipt(draft_no)
-            if receipt is None:
-                return None, False
-            return receipt, cur.rowcount > 0
+            return self.get_receipt(draft_no), (
+                "signed" if cur.rowcount > 0 else "already_signed"
+            )
 
     @staticmethod
     def _receipt_view(r: sqlite3.Row, draft: dict) -> dict:
@@ -668,20 +696,25 @@ class Store:
 
     # ------------------------------------------------------------------ 回放
 
-    def start_playback(self, draft_no: str) -> tuple[dict | None, bool]:
-        """拿稿号开始（或回到）一条回放，返回 (回放视图, 是否本次新开始)。
+    def start_playback(self, draft_no: str) -> tuple[dict | None, str]:
+        """拿稿号开始（或回到）一条回放，返回 (回放视图, 结果)。结果为：
 
-        位置只在**第一次**开始时建立（position=0）：之后再调只是取出当前
-        进度，绝不会把“听到哪了”拨回开头。稿已撤回时不插行、不重开，返回
-        (withdrawn 视图, False)。未知稿号返回 (None, False)。
+        - ``"started"``：本次新开始（position=0）；
+        - ``"existing"``：已开始过 —— 只回到当前进度，绝不重头再听；
+        - ``"withdrawn"``：稿已撤回 —— 不插行、不重开（即使此前没开始过）；
+        - ``"not_claimed"``：还没人认领 —— 没认领的稿不能听；
+        - ``"unknown"``：稿号不存在，视图为 None。
         """
         with self._lock, self._conn:
             draft = self.get_draft(draft_no)
             if draft is None:
-                return None, False
+                return None, "unknown"
             if draft["is_withdrawn"]:
                 # 撤回是终态：即使此前没开始过，也不允许撤后再开一条回放
-                return self.get_playback(draft_no), False
+                return self.get_playback(draft_no), "withdrawn"
+            if not self._is_claimed(draft_no):
+                # 没认领不能听：不产生任何进度，等有人认领后再开始
+                return self.get_playback(draft_no), "not_claimed"
             now = _now()
             cur = self._conn.execute(
                 "INSERT INTO playbacks(draft_no, call_id, position, started_at, updated_at)"
@@ -689,8 +722,9 @@ class Store:
                 " ON CONFLICT(draft_no) DO NOTHING",
                 (draft_no, draft["call_id"], now, now),
             )
-            started = cur.rowcount > 0
-            return self.get_playback(draft_no), started
+            return self.get_playback(draft_no), (
+                "started" if cur.rowcount > 0 else "existing"
+            )
 
     def advance_playback(self, draft_no: str) -> dict | None:
         """按顺序往下听一个拼装单元。
@@ -879,6 +913,124 @@ class Store:
                 (draft_no,),
             ).fetchall()
             return [self._row_to_late(r) for r in rows]
+
+    # ------------------------------------------------------------------ 认领
+
+    def _open_claim_row(self, draft_no: str) -> sqlite3.Row | None:
+        """当前持有中的认领（released_at 为 NULL 的那一条），没有则 None。"""
+        return self._conn.execute(
+            "SELECT * FROM claims WHERE draft_no=? AND released_at IS NULL",
+            (draft_no,),
+        ).fetchone()
+
+    def _is_claimed(self, draft_no: str) -> bool:
+        """这一稿此刻是否有人认领着 —— 签收、回放、撤回的前置条件。"""
+        return self._open_claim_row(draft_no) is not None
+
+    def claim_draft(self, draft_no: str, claimed_by: str) -> tuple[dict | None, str]:
+        """按稿号认领一稿，返回 (认领视图, 结果)。结果为：
+
+        - ``"claimed"``：本次认领成功，此后别人不能再认走；
+        - ``"reclaimed"``：就是当前持有人本人重复认领，幂等，时间不动；
+        - ``"already_held"``：别人正认领着，不能抢 —— 得等对方交出去；
+        - ``"unknown"``：稿号不存在，视图为 None。
+
+        认领只往 claims 插一行：drafts 里那一稿当时的正文和缺口一个字不改。
+        稿号自带 call_id，拿一通的号认不到另一通的稿。
+        """
+        with self._lock, self._conn:
+            draft = self._conn.execute(
+                "SELECT call_id FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if draft is None:
+                return None, "unknown"
+            open_claim = self._open_claim_row(draft_no)
+            if open_claim is not None:
+                if open_claim["claimed_by"] == claimed_by:
+                    return self.get_claim(draft_no), "reclaimed"
+                return self.get_claim(draft_no), "already_held"
+            self._conn.execute(
+                "INSERT INTO claims(draft_no, call_id, claimed_by, claimed_at)"
+                " VALUES(?,?,?,?)",
+                (draft_no, draft["call_id"], claimed_by, _now()),
+            )
+            return self.get_claim(draft_no), "claimed"
+
+    def release_claim(self, draft_no: str) -> tuple[dict | None, str]:
+        """把当前认领交出去，返回 (认领视图, 结果)。结果为：
+
+        - ``"released"``：本次交出成功，之后换别人认领；
+        - ``"not_claimed"``：当前没人认领着，无可交；
+        - ``"unknown"``：稿号不存在，视图为 None。
+
+        交出只填当前那条认领的 released_at（UPDATE 带 IS NULL 条件，影响 0 行
+        即没人持有）：历史认领记录一行不删，稿和签收单都碰不到。
+        """
+        with self._lock, self._conn:
+            exists = self._conn.execute(
+                "SELECT 1 FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if exists is None:
+                return None, "unknown"
+            cur = self._conn.execute(
+                "UPDATE claims SET released_at=?"
+                " WHERE draft_no=? AND released_at IS NULL",
+                (_now(), draft_no),
+            )
+            if cur.rowcount == 0:
+                return self.get_claim(draft_no), "not_claimed"
+            return self.get_claim(draft_no), "released"
+
+    def get_claim(self, draft_no: str) -> dict | None:
+        """按稿号取认领状态（当前谁认着 + 历次认领/交出记录）。
+        未知稿号返回 None。"""
+        with self._lock:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None
+            return self._claim_view(draft)
+
+    def list_claims(self, call_id: str) -> list[dict] | None:
+        """某通电话全部稿的认领状态（按发稿顺序）。查询本身带着 call_id，
+        结构上列不出另一通电话的认领。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT draft_no FROM drafts WHERE call_id=? ORDER BY draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._claim_view(self.get_draft(r["draft_no"])) for r in rows]
+
+    def _claim_view(self, draft: dict) -> dict:
+        rows = self._conn.execute(
+            "SELECT claimed_by, claimed_at, released_at FROM claims"
+            " WHERE draft_no=? ORDER BY id",
+            (draft["draft_no"],),
+        ).fetchall()
+        history = [
+            {
+                "claimed_by": r["claimed_by"],
+                "claimed_at": r["claimed_at"],
+                "released_at": r["released_at"],
+            }
+            for r in rows
+        ]
+        current = next((h for h in history if h["released_at"] is None), None)
+        return {
+            "draft_no": draft["draft_no"],
+            "call_id": draft["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "status": "claimed" if current is not None else "unclaimed",
+            "claimed_by": None if current is None else current["claimed_by"],
+            "claimed_at": None if current is None else current["claimed_at"],
+            # 历次认领/交出全留痕：谁认过、何时认、何时交出去
+            "history": history,
+            # 当时那一稿的完整快照 —— 认领动作改不了它的正文和缺口
+            "draft": draft,
+        }
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对

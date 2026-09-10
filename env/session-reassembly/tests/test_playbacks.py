@@ -36,6 +36,12 @@ def issue(client, call_id):
     return r.json()
 
 
+def claim(client, draft_no, by="张三"):
+    r = client.post(f"/drafts/{draft_no}/claim", json={"claimed_by": by})
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
 def start(client, draft_no):
     r = client.post(f"/drafts/{draft_no}/playback")
     assert r.status_code in (200, 201), r.text
@@ -66,6 +72,7 @@ def test_playback_starts_from_first_unit_and_advances_in_order(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 2, "听得到吗", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])                # 先认领，才能听
 
     r = start(client, d1["draft_no"])
     assert r.status_code == 201                  # 首次开始 201
@@ -98,6 +105,7 @@ def test_starting_again_keeps_position_and_does_not_restart(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 2, "听得到吗", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
 
     start(client, d1["draft_no"])
     advance(client, d1["draft_no"])              # 听到第 1 段后
@@ -130,6 +138,7 @@ def test_playback_stops_at_the_gap_and_cannot_skip_past_it(client):
     post(client, "C1", 4, "那就这样", is_last=True)   # 缺第 3 段时发稿
     d1 = issue(client, "C1")
     assert d1["gaps"] == [[3, 3]]
+    claim(client, d1["draft_no"])
 
     start(client, d1["draft_no"])
     advance(client, d1["draft_no"])                   # 片段 1
@@ -154,6 +163,7 @@ def test_late_filled_fragment_does_not_complete_old_playback(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 3, "那就这样", is_last=True)   # 缺第 2 段
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
     start(client, d1["draft_no"])
     advance(client, d1["draft_no"])                   # 听到片段 1
     blocked = advance(client, d1["draft_no"])        # 停在缺口 [2,2]
@@ -175,6 +185,7 @@ def test_new_draft_has_its_own_playback_old_one_remains_blocked(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 3, "那就这样", is_last=True)
     d1 = issue(client, "C1")                          # 旧稿带缺口
+    claim(client, d1["draft_no"])
     start(client, d1["draft_no"])
     advance(client, d1["draft_no"])
     advance(client, d1["draft_no"])                  # 旧回放停在缺口
@@ -184,6 +195,7 @@ def test_new_draft_has_its_own_playback_old_one_remains_blocked(client):
     assert d2["status"] == "complete"
     assert d2["supersedes"] == d1["draft_no"]
 
+    claim(client, d2["draft_no"])
     r = start(client, d2["draft_no"])                 # 另开一条回放
     assert r.status_code == 201
     assert r.json()["position"] == 0                 # 从新稿第 1 段开始
@@ -212,6 +224,8 @@ def test_playbacks_of_two_calls_never_get_mixed(client):
     post(client, "call-B", 2, "乙第二句", is_last=True)
     da = issue(client, "call-A")
     db = issue(client, "call-B")
+    claim(client, da["draft_no"])
+    claim(client, db["draft_no"])
 
     start(client, da["draft_no"])
     start(client, db["draft_no"])
@@ -245,6 +259,7 @@ def test_playback_position_survives_restart(tmp_path):
         post(c1, "C1", 2, "听得到吗")
         post(c1, "C1", 4, "那就这样", is_last=True)   # 缺第 3 段
         d1 = issue(c1, "C1")
+        claim(c1, d1["draft_no"])
         start(c1, d1["draft_no"])
         advance(c1, d1["draft_no"])
         advance(c1, d1["draft_no"])                  # 停在缺口
@@ -272,6 +287,7 @@ def test_playback_changes_neither_draft_nor_receipt(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 3, "那就这样", is_last=True)   # 缺第 2 段
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
     start(client, d1["draft_no"])
     advance(client, d1["draft_no"])
     advance(client, d1["draft_no"])                  # 停在缺口

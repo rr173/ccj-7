@@ -110,6 +110,7 @@ def test_late_fragment_changes_neither_draft_receipt_nor_blocked_playback(client
     post(client, "C1", 3, "那就这样", is_last=True)   # 缺第 2 段
     d1 = issue(client, "C1")
 
+    client.post(f"/drafts/{d1['draft_no']}/claim", json={"claimed_by": "张三"})
     client.post(f"/drafts/{d1['draft_no']}/playback")
     client.post(f"/drafts/{d1['draft_no']}/playback/advance")      # 听到片段 1
     blocked = client.post(f"/drafts/{d1['draft_no']}/playback/advance").json()

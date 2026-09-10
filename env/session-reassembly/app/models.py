@@ -18,3 +18,9 @@ class FragmentIn(BaseModel):
     seq: int = Field(ge=1)
     text: str = Field(default="", max_length=65536)
     is_last: bool = False
+
+
+class ClaimIn(BaseModel):
+    """认领一稿：认领人标识。稿一旦被人认领，别人不能再认走，
+    直到当前认领人把它交出去（release）。"""
+    claimed_by: str = Field(min_length=1, max_length=256)

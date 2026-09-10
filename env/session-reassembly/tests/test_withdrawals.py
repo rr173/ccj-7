@@ -35,6 +35,12 @@ def issue(client, call_id):
     return r.json()
 
 
+def claim(client, draft_no, by="张三"):
+    r = client.post(f"/drafts/{draft_no}/claim", json={"claimed_by": by})
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
 def get_draft(client, draft_no):
     r = client.get(f"/drafts/{draft_no}")
     assert r.status_code == 200, r.text
@@ -79,6 +85,7 @@ def test_withdraw_by_draft_no_and_record_shows_exact_draft(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 3, "那就这样", is_last=True)       # 缺第 2 段
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])                        # 先认领，才能撤
 
     w = withdraw(client, d1["draft_no"])
 
@@ -115,6 +122,7 @@ def test_withdrawal_does_not_modify_pinned_content_or_gaps(client):
     post(client, "C1", 2, "听得到吗")
     post(client, "C1", 4, "那就这样", is_last=True)       # 缺第 3 段
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
 
     w = withdraw(client, d1["draft_no"])
     post(client, "C1", 3, "信号不太好")                    # 撤回后缺口才补齐
@@ -138,6 +146,7 @@ def test_withdrawal_does_not_modify_pinned_content_or_gaps(client):
 def test_withdrawal_is_idempotent_conflict_not_second_record(client):
     post(client, "C1", 1, "你好", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
     first = withdraw(client, d1["draft_no"])
 
     again = client.post(f"/drafts/{d1['draft_no']}/withdrawal")
@@ -150,6 +159,7 @@ def test_withdrawal_is_idempotent_conflict_not_second_record(client):
 def test_signed_draft_cannot_be_withdrawn(client):
     post(client, "C1", 1, "你好", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
     signed = sign(client, d1["draft_no"])
     assert signed.status_code == 201
 
@@ -167,6 +177,7 @@ def test_withdrawn_unsigned_draft_cannot_be_signed(client):
     before = receipt(client, d1["draft_no"])
     assert before["status"] == "pending"
 
+    claim(client, d1["draft_no"])
     withdraw(client, d1["draft_no"])
 
     r = sign(client, d1["draft_no"])
@@ -200,6 +211,7 @@ def test_withdrawal_freezes_active_playback_at_current_position(client):
     post(client, "C1", 2, "听得到吗")
     post(client, "C1", 3, "那就这样", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
 
     assert start(client, d1["draft_no"]).status_code == 201
     advance(client, d1["draft_no"])                      # 已听到第 1 段
@@ -227,6 +239,7 @@ def test_withdrawal_freezes_active_playback_at_current_position(client):
 def test_withdraw_before_playback_starts_then_playback_cannot_start(client):
     post(client, "C1", 1, "你好", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
     withdraw(client, d1["draft_no"])
 
     assert start(client, d1["draft_no"]).status_code == 409
@@ -245,6 +258,8 @@ def test_withdrawals_of_two_calls_never_get_mixed(client):
     post(client, "call-B", 2, "乙第二句", is_last=True)
     da = issue(client, "call-A")
     db = issue(client, "call-B")
+    claim(client, da["draft_no"])
+    claim(client, db["draft_no"])
 
     w = withdraw(client, da["draft_no"])
     assert w["call_id"] == "call-A"
@@ -277,6 +292,7 @@ def test_withdrawals_survive_restart_and_remain_terminal(tmp_path):
         post(c1, "C1", 1, "你好")
         post(c1, "C1", 3, "结束", is_last=True)
         d1 = issue(c1, "C1")
+        claim(c1, d1["draft_no"])
         start(c1, d1["draft_no"])
         advance(c1, d1["draft_no"])
         w1 = withdraw(c1, d1["draft_no"])

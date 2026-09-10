@@ -35,6 +35,12 @@ def issue(client, call_id):
     return r.json()
 
 
+def claim(client, draft_no, by="张三"):
+    r = client.post(f"/drafts/{draft_no}/claim", json={"claimed_by": by})
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
 def get_receipt(client, draft_no):
     r = client.get(f"/drafts/{draft_no}/receipt")
     assert r.status_code == 200, r.text
@@ -82,6 +88,7 @@ def test_sign_by_draft_no_and_receipt_shows_which_draft_was_signed(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 2, "听得到吗", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])                      # 先认领，才能签
 
     r = sign(client, d1["draft_no"])                   # 按稿号签
     # 签完看得出签的是哪一稿
@@ -101,6 +108,7 @@ def test_same_draft_cannot_be_signed_twice(client):
     post(client, "C1", 1, "你好")
     post(client, "C1", 2, "听得到吗", is_last=True)
     d1 = issue(client, "C1")
+    claim(client, d1["draft_no"])
 
     first = sign(client, d1["draft_no"])
     r = client.post(f"/drafts/{d1['draft_no']}/receipt")
@@ -157,6 +165,7 @@ def test_new_draft_does_not_replace_pending_old_one(client):
         ("C1-D0002", "pending"),
     ]
 
+    claim(client, d2["draft_no"])
     sign(client, d2["draft_no"])                       # 签新稿 ≠ 签旧稿
     assert get_receipt(client, d1["draft_no"])["status"] == "pending"
     assert get_receipt(client, d2["draft_no"])["status"] == "signed"
@@ -171,6 +180,8 @@ def test_two_calls_receipts_never_get_mixed(client):
     post(client, "call-B", 3, "乙第三句", is_last=True)  # 乙缺第 2 段
     da = issue(client, "call-A")
     db = issue(client, "call-B")
+    claim(client, da["draft_no"])
+    claim(client, db["draft_no"])
 
     signed_a = sign(client, da["draft_no"])            # 签甲的
     assert signed_a["call_id"] == "call-A"
@@ -204,6 +215,7 @@ def test_unsigned_receipts_survive_restart(tmp_path):
         d1 = issue(c1, "C1")                          # 待签
         post(c1, "C1", 2, "听得到吗")
         d2 = issue(c1, "C1")
+        claim(c1, d2["draft_no"])
         signed = sign(c1, d2["draft_no"])             # 新稿签掉，旧稿留着
 
     with TestClient(create_app(db)) as c2:            # 同一数据库文件重新拉起
@@ -216,11 +228,10 @@ def test_unsigned_receipts_survive_restart(tmp_path):
         assert done["status"] == "signed"
         assert done["signed_at"] == signed["signed_at"]
 
+        claim(c2, d1["draft_no"])                     # 重启后还能正常认领
         r = sign(c2, d1["draft_no"])                  # 重启后旧待签还能正常签掉
         assert r["status"] == "signed"
         assert r["draft"] == d1
-
-
 def test_receipts_backfilled_for_drafts_issued_before_upgrade(tmp_path):
     # 老库：drafts 表里有稿，但还没有 receipts 表（升级前的库）
     import sqlite3
@@ -259,5 +270,6 @@ def test_receipts_backfilled_for_drafts_issued_before_upgrade(tmp_path):
         assert r["status"] == "pending"
         assert r["draft"]["content"] == "你好"
         assert r["issued_at"] == "t0"
+        claim(c, "C1-D0001")                          # 老稿同样要先认领
         signed = sign(c, "C1-D0001")                  # 也能正常签收
         assert signed["status"] == "signed"

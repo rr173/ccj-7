@@ -78,6 +78,14 @@
   `withdrawn`，之后不能继续推进，也不能重新开始；没开始过的稿撤回后同样
   不能再开。稿号自带 `call_id`，全局稿号操作也撤不到另一通电话；撤回记录
   落 SQLite，重启后仍是终态。
+- **发出去的稿要先有人认领**：`POST /drafts/{draft_no}/claim` 按稿号认领，
+  没认领的稿不能签收、不能回放、也不能撤回（一律 409）。一稿同一时刻
+  至多一个人持有：一个人认了，别人再认是 409，认不走；本人重复认领幂等
+  （200，时间不动）。当前认领人 `POST .../claim/release` 把稿交出去之后，
+  别人才能认领；交出后、还没人认期间同样不能签/听/撤。认领只往 `claims`
+  表写记录，绝不碰 `drafts`——那一稿当时的正文和缺口一个字不变；每次
+  认领/交出都在 `history` 里留痕。稿号自带 `call_id`，拿一通的号认不到
+  另一通的稿；认领记录落 SQLite，重启后认了谁还在。
 - **稿发出后才到的段单独记迟到**：某通电话发出至少一稿后，新入库的片段
   （内容相同的重传不算——它没带来新东西）会单独记进迟到记录，挂上到达
   时最新的一稿，看得出补在哪一稿后面；接收响应里 `ingest.late=true`
@@ -109,6 +117,10 @@ POST /drafts/{draft_no}/playback/advance  按顺序听下一段（blocked 时位
 GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
 GET  /sessions/{call_id}/late-fragments  该通话的全部迟到片段（按到达顺序，各自补在哪一稿后面）
 GET  /drafts/{draft_no}/late-fragments   补在这一稿后面的迟到片段
+POST /drafts/{draft_no}/claim            按稿号认领（201；本人重复认领 200；别人已认领 409；未知稿号 404）
+POST /drafts/{draft_no}/claim/release    把当前认领交出去，之后才能换人认（200；未认领 409）
+GET  /drafts/{draft_no}/claim            这一稿现在谁认着（含历次认领/交出记录）
+GET  /sessions/{call_id}/claims          该通话全部稿的认领状态（按发稿顺序）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -153,6 +165,14 @@ GET  /docs                             Swagger UI
 发稿后才到的。迟到记录只往 `late_fragments` 表插行，从不修改 `drafts`、
 `receipts`、`playbacks`。
 
+认领（claim）关键字段：`draft_no`/`call_id`/`draft_seq`（认的是哪一稿）、
+`status`（`claimed` 有人持有 / `unclaimed` 没人认）、`claimed_by`/`claimed_at`
+（当前谁认着、何时认的，未认领为 `null`）、`history`（历次认领/交出记录：
+谁认的、何时认、何时交出去，永不删除）、`draft`（当时那一稿的完整快照——
+认领、交出、换人认都改不了它的正文和缺口）。没认领的稿签收、回放、撤回
+一律 409；认领记录只往 `claims` 表写，从不修改 `drafts`、`receipts`、
+`playbacks`。
+
 ### 示例
 
 ```bash
@@ -196,7 +216,12 @@ curl localhost:8000/drafts/C1-D0001
 ### 下游签收
 
 ```bash
-# 发出去的稿自动进入待签；下游按稿号签收
+# 发出去的稿要先有人认领，没认领不能签（409）
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
+# {"draft_no":"C1-D0001","status":"claimed","claimed_by":"张三",...}
+
+# 稿一发出即进入待签；认领后下游按稿号签收
 curl -X POST localhost:8000/drafts/C1-D0001/receipt
 # {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,"status":"signed",
 #  "signed_at":"...", "draft":{...当时那一稿...}}
@@ -212,7 +237,9 @@ curl localhost:8000/sessions/C1/receipts
 ### 撤回未签收稿
 
 ```bash
-# C1-D0001 未签，拿稿号撤回；响应里仍带完整快照，看得出撤的是哪一稿
+# 撤回也要先认领；C1-D0001 未签，拿稿号撤回
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
 curl -X POST localhost:8000/drafts/C1-D0001/withdrawal
 # {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,
 #  "withdrawn_at":"...","receipt_status":"withdrawn","draft":{...当时那稿...}}
@@ -235,7 +262,9 @@ curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
 
 ```bash
 # 缺第 3 段时已对外给过 C1-D0001（正文含 [缺口:片段3]）
-# 拿稿号开始听，从第 1 段顺序往后
+# 听也要先认领；认了之后拿稿号开始听，从第 1 段顺序往后
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
 curl -X POST localhost:8000/drafts/C1-D0001/playback
 # {"status":"playing","position":0,"total_units":4,"next":{"seq":1,"text":"你好"},...}
 
@@ -252,6 +281,8 @@ curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
 
 # 缺口后来补上、会话已 complete —— 但这条旧回放不会突然变完整，仍停在缺口前；
 # 补齐后另发了新稿 C1-D0002，想听完整内容得拿新稿号另开一条回放
+curl -X POST localhost:8000/drafts/C1-D0002/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
 curl -X POST localhost:8000/drafts/C1-D0002/playback
 # 两条回放互不干扰：旧稿继续 blocked，新稿从 0 开始可一路 finished
 
@@ -285,6 +316,37 @@ curl localhost:8000/drafts/C1-D0001/late-fragments   # 补在这一稿后面的�
 # 例另发新稿（C1-D0002），之后新到的段就记在 D0002 后面
 ```
 
+### 先认领，再办事
+
+```bash
+# 稿发出去后，没人认领时：签、听、撤一律 409
+curl -X POST localhost:8000/drafts/C1-D0001/receipt        # 409 draft not claimed
+
+# 张三认领这一稿（稿号认到哪一稿、哪一通，一目了然）
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
+# {"draft_no":"C1-D0001","call_id":"C1","status":"claimed",
+#  "claimed_by":"张三","claimed_at":"...","history":[...],"draft":{...当时那稿...}}
+
+# 张三认着，李四认不走；张三自己重复认领幂等（200，时间不动）
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"李四"}'   # 409
+
+# 张三把稿交出去，之后李四才能认；交出后没人认期间同样不能签/听/撤
+curl -X POST localhost:8000/drafts/C1-D0001/claim/release
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"李四"}'   # 201
+
+# 谁认过、何时认、何时交出去，全部留痕；那一稿的正文和缺口始终原样
+curl localhost:8000/drafts/C1-D0001/claim
+# {"status":"claimed","claimed_by":"李四",
+#  "history":[{"claimed_by":"张三","claimed_at":"...","released_at":"..."},
+#             {"claimed_by":"李四","claimed_at":"...","released_at":null}],...}
+
+# 该通话全部稿的认领状态；拿一通的号认不到另一通的稿
+curl localhost:8000/sessions/C1/claims
+```
+
 ## 运行
 
 ### Docker
@@ -315,7 +377,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           69 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           78 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -323,8 +385,11 @@ tests/           69 个测试：乱序、重传、通话隔离、缺口（含越
                  新旧稿两条回放独立、两通电话不串、重启停在原处、不改稿不签收），
                  撤回（按号撤回、快照不改正文缺口、已签不可撤、撤后不可签、
                  正在听停在原处、两通电话不串、重启后仍是撤回态），
-                 以及迟到片段（单独记录、看得出补在哪一稿后面、不改稿不动待签
-                 不让回放突然听完、两通电话不串、重启后记录还在）
+                 迟到片段（单独记录、看得出补在哪一稿后面、不改稿不动待签
+                 不让回放突然听完、两通电话不串、重启后记录还在），
+                 以及认领（没认领不能签/听/撤、认了别人认不走、本人重复认领
+                 幂等、交出去才能换人认、认领不改稿、两通电话不串、
+                 重启后认了谁还在）
 Dockerfile / docker-compose.yml
 ```
 
