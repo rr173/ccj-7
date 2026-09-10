@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-六张表：
+七张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -28,6 +28,13 @@
                上的段也不会让这条旧稿的回放突然变完整（要听补齐后的内容得
                另发新稿、另开一条回放）。本表只记录进度，永不写 drafts /
                receipts —— 回放既不改稿，也不会把待签签掉。
+- late_fragments : 迟到片段记录 —— 某通电话**已发出至少一稿之后**才新入库
+               的片段（内容相同的重传不算，它没带来新东西）。每笔记上片段
+               本身和“到达时最新的一稿”，看得出补在哪一稿后面。只往本表
+               插行，绝不碰 drafts / receipts / playbacks —— 迟到的段改
+               不了已发的稿、动不了待签，也没法让停在缺口上的回放突然听完。
+               记录按 call_id 归组、落在 SQLite 里：两通电话的迟到记录不
+               串，重启后还在。
 """
 
 from __future__ import annotations
@@ -104,6 +111,17 @@ CREATE TABLE IF NOT EXISTS playbacks (
     finished_at TEXT              -- 听到快照末尾的时刻；停在缺口时为 NULL
 );
 CREATE INDEX IF NOT EXISTS idx_playbacks_call ON playbacks(call_id);
+CREATE TABLE IF NOT EXISTS late_fragments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,  -- 到达顺序
+    call_id         TEXT NOT NULL,      -- 属于哪通电话，按通话查/隔离都带着它
+    seq             INTEGER NOT NULL,   -- 片段序号
+    text            TEXT NOT NULL,      -- 片段内容（到达时的原文）
+    after_draft_no  TEXT NOT NULL REFERENCES drafts(draft_no),  -- 补在哪一稿后面
+    after_draft_seq INTEGER NOT NULL,   -- 该通话第几稿
+    arrived_at      TEXT NOT NULL       -- 到达时刻（晚于那一稿的 issued_at）
+);
+CREATE INDEX IF NOT EXISTS idx_late_call ON late_fragments(call_id);
+CREATE INDEX IF NOT EXISTS idx_late_draft ON late_fragments(after_draft_no);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -266,7 +284,30 @@ class Store:
                     (call_id,),
                 )
 
-            return {"stored": not duplicate, "duplicate": duplicate, "conflict": conflict}
+            # 这通电话已经对外发过稿：新入库的片段是“迟到”的 —— 单独记一笔，
+            # 挂上到达时最新的一稿（看得出补在哪一稿后面）。只往
+            # late_fragments 插行：已发的稿、待签的签收单、停在缺口上的
+            # 回放都碰不到这笔记录，也不会被它改动。内容相同的重传不算
+            # 迟到 —— 它没带来任何新东西。
+            late = False
+            if not duplicate:
+                latest = self._conn.execute(
+                    "SELECT draft_no, draft_seq FROM drafts WHERE call_id=?"
+                    " ORDER BY draft_seq DESC LIMIT 1",
+                    (call_id,),
+                ).fetchone()
+                if latest is not None:
+                    late = True
+                    self._conn.execute(
+                        "INSERT INTO late_fragments(call_id, seq, text,"
+                        " after_draft_no, after_draft_seq, arrived_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (call_id, seq, text, latest["draft_no"],
+                         latest["draft_seq"], now),
+                    )
+
+            return {"stored": not duplicate, "duplicate": duplicate,
+                    "conflict": conflict, "late": late}
 
     def _seqs(self, call_id: str) -> set[int]:
         rows = self._conn.execute(
@@ -654,6 +695,51 @@ class Store:
                 (call_id,),
             ).fetchall()
             return [self._playback_view(r, self.get_draft(r["draft_no"])) for r in rows]
+
+    # ------------------------------------------------------------------ 迟到片段
+
+    @staticmethod
+    def _row_to_late(r: sqlite3.Row) -> dict:
+        return {
+            "call_id": r["call_id"],
+            "seq": r["seq"],
+            "text": r["text"],
+            # 补在哪一稿后面：到达那一刻该通话最新的一稿（稿号自带 call_id）
+            "after_draft_no": r["after_draft_no"],
+            "after_draft_seq": r["after_draft_seq"],
+            "arrived_at": r["arrived_at"],
+        }
+
+    def list_late_fragments(self, call_id: str) -> list[dict] | None:
+        """某通电话的全部迟到片段（按到达顺序）。
+
+        查询本身带着 call_id，结构上列不出另一通电话的迟到记录 —— 两通
+        电话的迟到记录物理上不串。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM late_fragments WHERE call_id=? ORDER BY id",
+                (call_id,),
+            ).fetchall()
+            return [self._row_to_late(r) for r in rows]
+
+    def list_late_fragments_for_draft(self, draft_no: str) -> list[dict] | None:
+        """补在某一稿后面的全部迟到片段（按到达顺序）：那一稿发出之后、
+        下一稿发出之前新到的片段。只读 late_fragments 表 —— 稿、待签、
+        回放都不受影响。未知稿号返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM late_fragments WHERE after_draft_no=? ORDER BY id",
+                (draft_no,),
+            ).fetchall()
+            return [self._row_to_late(r) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对

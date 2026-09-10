@@ -14,6 +14,8 @@
     GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
     POST /drafts/{draft_no}/playback/advance  按顺序听下一段：轮到当时的缺口就停住
     GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
+    GET  /sessions/{call_id}/late-fragments  该通话的全部迟到片段（按到达顺序，各自补在哪一稿后面）
+    GET  /drafts/{draft_no}/late-fragments   补在这一稿后面的迟到片段
     GET  /healthz                          健康检查
 """
 
@@ -33,7 +35,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.3.0",
+        version="1.4.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -163,6 +165,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if playbacks is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"playbacks": playbacks}
+
+    # -------------------------------------------------------------- 迟到片段
+
+    @app.get("/sessions/{call_id}/late-fragments")
+    def list_late_fragments(call_id: str):
+        """该通话的全部迟到片段（按到达顺序）：发过至少一稿之后才新到的段，
+        各自看得出补在哪一稿后面。查询带 call_id，两通电话的记录不串。"""
+        late = store.list_late_fragments(call_id)
+        if late is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"late_fragments": late}
+
+    @app.get("/drafts/{draft_no}/late-fragments")
+    def list_late_fragments_for_draft(draft_no: str):
+        """补在这一稿后面的迟到片段：它发出之后才到、没能进这一稿的段。
+        只读迟到记录 —— 稿、待签、回放都不受影响。"""
+        late = store.list_late_fragments_for_draft(draft_no)
+        if late is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return {"draft_no": draft_no, "late_fragments": late}
 
     @app.get("/healthz")
     def healthz():

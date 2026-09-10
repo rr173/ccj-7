@@ -69,6 +69,14 @@
   稿号自带 `call_id`，按通话列出（`GET /sessions/{call_id}/playbacks`）
   也带 `call_id` 过滤，两通电话的回放物理上不串。回放代码路径只写新的
   `playbacks` 表、只读 `drafts`：**不把稿改掉，也不把待签签掉**。
+- **稿发出后才到的段单独记迟到**：某通电话发出至少一稿后，新入库的片段
+  （内容相同的重传不算——它没带来新东西）会单独记进迟到记录，挂上到达
+  时最新的一稿，看得出补在哪一稿后面；接收响应里 `ingest.late=true`
+  当场标出。迟到记录只往自己的表里插行：已发的稿一字不改、待签原样
+  欠着、停在缺口上的回放不会突然听完。记录按 `call_id` 归组，按通话
+  查（`GET /sessions/{call_id}/late-fragments`）或按稿查
+  （`GET /drafts/{draft_no}/late-fragments`）都带着标识，两通电话的
+  迟到记录不串；同样落 SQLite，重启后还在。
 
 ## API
 
@@ -87,6 +95,8 @@ POST /drafts/{draft_no}/playback       拿稿号开始回放（首次 201；已�
 GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
 POST /drafts/{draft_no}/playback/advance  按顺序听下一段（blocked 时位置不动）
 GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
+GET  /sessions/{call_id}/late-fragments  该通话的全部迟到片段（按到达顺序，各自补在哪一稿后面）
+GET  /drafts/{draft_no}/late-fragments   补在这一稿后面的迟到片段
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -116,6 +126,12 @@ GET  /docs                             Swagger UI
 `heard`（仅推进响应：本次刚听到的片段；停在缺口或已听完为 `null`）、
 `started_at`/`updated_at`/`finished_at`、`draft`（回放所基于的当时那稿快照）。
 回放只新增 `playbacks` 进度，从不修改 `drafts`，也不触碰 `receipts`。
+
+迟到片段（late fragment）关键字段：`call_id`、`seq`、`text`（到达时的原文）、
+`after_draft_no`/`after_draft_seq`（补在哪一稿后面——到达那一刻该通话最新的
+一稿）、`arrived_at`。接收片段的响应里 `ingest.late` 为 `true` 表示这一段是
+发稿后才到的。迟到记录只往 `late_fragments` 表插行，从不修改 `drafts`、
+`receipts`、`playbacks`。
 
 ### 示例
 
@@ -208,6 +224,25 @@ curl localhost:8000/sessions/C1/playbacks
 回放只读稿快照、只写自己的进度：`GET /drafts/C1-D0001` 拿到的稿一字不变，
 `GET /drafts/C1-D0001/receipt` 仍是 `pending`——听稿不改稿、不签收。
 
+### 稿发出后才到的段
+
+```bash
+# C1-D0001 带着缺口 [缺口:片段3] 发出后，第 3 段才姗姗来迟
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C1","seq":3,"text":"信号不太好"}'
+# {"ingest":{"stored":true,"duplicate":false,"conflict":false,"late":true},...}
+
+# 已发的稿、待签、停在缺口上的回放全都原样不动；迟到的段单独可查，
+# 看得出补在哪一稿后面
+curl localhost:8000/sessions/C1/late-fragments
+# {"late_fragments":[{"call_id":"C1","seq":3,"text":"信号不太好",
+#   "after_draft_no":"C1-D0001","after_draft_seq":1,"arrived_at":"..."}]}
+curl localhost:8000/drafts/C1-D0001/late-fragments   # 补在这一稿后面的段
+
+# 内容相同的重传不算迟到（没带来新东西）；想对外给补齐后的内容，照
+# 例另发新稿（C1-D0002），之后新到的段就记在 D0002 后面
+```
+
 ## 运行
 
 ### Docker
@@ -238,12 +273,14 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           52 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           59 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
-                 以及回放（顺序收听、缺口停住不跳过、补段不让旧稿变完整、
-                 新旧稿两条回放独立、两通电话不串、重启停在原处、不改稿不签收）
+                 回放（顺序收听、缺口停住不跳过、补段不让旧稿变完整、
+                 新旧稿两条回放独立、两通电话不串、重启停在原处、不改稿不签收），
+                 以及迟到片段（单独记录、看得出补在哪一稿后面、不改稿不动待签
+                 不让回放突然听完、两通电话不串、重启后记录还在）
 Dockerfile / docker-compose.yml
 ```
 
