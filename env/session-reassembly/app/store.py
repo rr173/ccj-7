@@ -6,8 +6,10 @@
 三张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
-- gap_events : 缺口历史。缺口出现记一行，补上时填 filled_at，永不删除，
-               用来回答“这条会话曾经缺过吗”
+- gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
+               写新行，补齐时填 filled_at，永不删除。区间存储保证序号空一
+               大截时也只有几行、几次运算，不会逐号展开卡死。
+               用来回答“这条会话曾经缺过吗”。
 """
 
 from __future__ import annotations
@@ -38,12 +40,21 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 CREATE TABLE IF NOT EXISTS gap_events (
     call_id     TEXT NOT NULL,
-    seq         INTEGER NOT NULL,
+    seq_lo      INTEGER NOT NULL,
+    seq_hi      INTEGER NOT NULL,
     detected_at TEXT NOT NULL,
     filled_at   TEXT,
-    PRIMARY KEY (call_id, seq)
+    PRIMARY KEY (call_id, seq_lo, seq_hi)
 );
 """
+
+# 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
+LEGACY_GAP_EVENTS_DDL = (
+    "CREATE TABLE gap_events ("
+    "call_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+    "detected_at TEXT NOT NULL, filled_at TEXT, "
+    "PRIMARY KEY (call_id, seq))"
+)
 
 
 def _now() -> str:
@@ -59,11 +70,47 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
+        self._migrate_legacy_gap_events()
         self._conn.executescript(SCHEMA)
         self._lock = threading.RLock()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _migrate_legacy_gap_events(self) -> None:
+        """旧库（gap_events 只有 seq 一列）迁移为区间表：
+        按 (call_id, filled_at) 把相邻序号合并成区间，detected_at 取最早、
+        filled_at 保留（区间里只要还有没补齐的就视为未补齐，逐行对账会再校正）。
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(gap_events)").fetchall()
+        }
+        if not cols or {"seq_lo", "seq_hi"} <= cols:
+            return  # 没有旧表，或已经是新结构
+
+        legacy = self._conn.execute(
+            "SELECT call_id, seq, detected_at, filled_at FROM gap_events ORDER BY call_id, seq"
+        ).fetchall()
+        self._conn.execute("DROP TABLE gap_events")
+        self._conn.execute(
+            "CREATE TABLE gap_events ("
+            "call_id TEXT NOT NULL, seq_lo INTEGER NOT NULL, seq_hi INTEGER NOT NULL, "
+            "detected_at TEXT NOT NULL, filled_at TEXT, "
+            "PRIMARY KEY (call_id, seq_lo, seq_hi))"
+        )
+        groups: dict = {}
+        for r in legacy:
+            groups.setdefault((r["call_id"], r["filled_at"]), []).append(r)
+        for (call_id, filled_at), rows in groups.items():
+            nums = [r["seq"] for r in rows]
+            detected = min(r["detected_at"] for r in rows)
+            for lo, hi in R.to_ranges(nums):
+                self._conn.execute(
+                    "INSERT INTO gap_events(call_id, seq_lo, seq_hi, detected_at, filled_at)"
+                    " VALUES(?,?,?,?,?)",
+                    (call_id, lo, hi, detected, filled_at),
+                )
 
     # ------------------------------------------------------------------ 写入
 
@@ -130,13 +177,22 @@ class Store:
             seqs = self._seqs(call_id)
             self._update_gap_events(call_id, seqs, now)
 
-            if last_seq is not None and all(
-                n in seqs for n in range(1, last_seq + 1)
-            ):
+            # 完整与否只看“到过的序号”：实际到达已连成一片、且越过结束序号，
+            # 才算完整。正文上界（实际最大序号）里只要还夹着缺口，绝不置完成时间。
+            status = R.status_of(seqs, last_seq)
+            if status == R.COMPLETE:
+                # COALESCE：已经正经完成过，后续重传/越界片段不得挪动完成时间
                 self._conn.execute(
                     "UPDATE calls SET completed_at=COALESCE(completed_at, ?)"
                     " WHERE call_id=?",
                     (now, call_id),
+                )
+            else:
+                # 曾被过早置上完成时间、后来暴露出缺口（越界片段到达）→ 撤回，
+                # 绝不能对外挂着“已完成”的时间戳、正文里却夹着缺口
+                self._conn.execute(
+                    "UPDATE calls SET completed_at=NULL WHERE call_id=?",
+                    (call_id,),
                 )
 
             return {"stored": not duplicate, "duplicate": duplicate, "conflict": conflict}
@@ -147,28 +203,58 @@ class Store:
         ).fetchall()
         return {r["seq"] for r in rows}
 
-    def _update_gap_events(self, call_id: str, seqs: set[int], now: str) -> None:
-        """把当前缺口和 gap_events 表对账：新缺口记一行，补上的填 filled_at。"""
-        if not seqs:
-            return
-        missing = set(R.missing_below(seqs, max(seqs)))
-        open_gaps = {
-            r["seq"]
+    def _open_gap_ranges(self, call_id: str) -> list[tuple[int, int, str]]:
+        return [
+            (r["seq_lo"], r["seq_hi"], r["detected_at"])
             for r in self._conn.execute(
-                "SELECT seq FROM gap_events WHERE call_id=? AND filled_at IS NULL",
+                "SELECT seq_lo, seq_hi, detected_at FROM gap_events"
+                " WHERE call_id=? AND filled_at IS NULL ORDER BY seq_lo",
                 (call_id,),
             )
-        }
-        for s in sorted(missing - open_gaps):
+        ]
+
+    def _update_gap_events(self, call_id: str, seqs: set[int], now: str) -> None:
+        """当前缺口与 gap_events 对账，全程区间运算：
+
+        - 旧缺口整段仍在：不动；
+        - 旧缺口被整体补齐：历史行填 filled_at 关闭；
+        - 旧缺口只补齐一部分（缺口缩小/被切成几段）：旧历史行关闭，仍缺的
+          残留段另开一行并**继承原来的 detected_at**（这段确实从那时起就缺）；
+        - 新出现/扩大连通出来的缺口段：插新行，detected_at=now。
+        无论怎么变化，曾经缺过多大、何时发现、何时补齐，永远查得到。
+        """
+        if not seqs:
+            return
+        current = R.missing_ranges(seqs, max(seqs))   # 确凿缺口（更大的号已到）
+        open_rows = self._open_gap_ranges(call_id)
+        old_merged = R.merge_ranges([[lo, hi] for lo, hi, _ in open_rows])
+
+        for lo, hi, detected in open_rows:
+            still = R.intersect_ranges([[lo, hi]], current)
+            if still != [[lo, hi]]:
+                # 整段或部分已补齐 → 关闭旧历史行
+                self._conn.execute(
+                    "UPDATE gap_events SET filled_at=? "
+                    "WHERE call_id=? AND seq_lo=? AND seq_hi=? AND filled_at IS NULL",
+                    (now, call_id, lo, hi),
+                )
+            for slo, shi in still:
+                if (slo, shi) != (lo, hi):
+                    # 残留段继承原发现时间另开一行
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO gap_events"
+                        "(call_id, seq_lo, seq_hi, detected_at)"
+                        " VALUES(?,?,?,?)",
+                        (call_id, slo, shi, detected),
+                    )
+
+        # 与任何旧行都不重叠的部分 = 这次新出现/新扩出来的缺口
+        for lo, hi in R.subtract_ranges(current, old_merged):
             self._conn.execute(
-                "INSERT OR IGNORE INTO gap_events(call_id, seq, detected_at)"
-                " VALUES(?,?,?)",
-                (call_id, s, now),
-            )
-        for s in sorted(open_gaps - missing):
-            self._conn.execute(
-                "UPDATE gap_events SET filled_at=? WHERE call_id=? AND seq=?",
-                (now, call_id, s),
+                "INSERT OR IGNORE INTO gap_events"
+                "(call_id, seq_lo, seq_hi, detected_at)"
+                " VALUES(?,?,?,?)",
+                (call_id, lo, hi, now),
             )
 
     # ------------------------------------------------------------------ 读取
@@ -189,15 +275,21 @@ class Store:
             seq_to_text = {f["seq"]: f["text"] for f in frags}
             seqs = set(seq_to_text)
             last_seq = call["last_seq"]
-            hi = max([last_seq or 0, *seqs], default=0)
+            top = max(seqs, default=0)
 
-            parts = R.build_parts(seq_to_text, hi)
-            gaps = R.to_ranges(R.missing_below(seqs, hi)) if hi else []
+            # 正文与缺口只覆盖“到过的范围”：更大的号已到、中间缺的才是缺口；
+            # 结尾片段还在路上不属于缺口，不编造标记。
+            parts = R.build_parts(seq_to_text, top)
+            gaps = R.missing_ranges(seqs, top) if top else []
             gap_history = [
-                dict(r)
+                {
+                    "range": [r["seq_lo"], r["seq_hi"]],
+                    "detected_at": r["detected_at"],
+                    "filled_at": r["filled_at"],
+                }
                 for r in self._conn.execute(
-                    "SELECT seq, detected_at, filled_at FROM gap_events"
-                    " WHERE call_id=? ORDER BY seq",
+                    "SELECT seq_lo, seq_hi, detected_at, filled_at FROM gap_events"
+                    " WHERE call_id=? ORDER BY seq_lo, seq_hi",
                     (call_id,),
                 )
             ]
@@ -228,8 +320,8 @@ class Store:
             out = []
             for c in calls:
                 seqs = self._seqs(c["call_id"])
-                hi = max([c["last_seq"] or 0, *seqs], default=0)
-                open_gaps = R.to_ranges(R.missing_below(seqs, hi)) if hi else []
+                top = max(seqs, default=0)
+                open_gaps = R.missing_ranges(seqs, top) if top else []
                 n_gap_events = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM gap_events WHERE call_id=?",
                     (c["call_id"],),

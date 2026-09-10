@@ -108,9 +108,114 @@ def test_gap_filled_later_session_becomes_complete_but_remembers(client):
     assert "[缺口" not in after["content"]
     assert after["version"] > v_before          # 客户端能发现视图变了
     assert after["was_incomplete"] is True      # 能看出曾经缺过
-    assert after["gap_history"][0]["seq"] == 2
+    assert after["gap_history"][0]["range"] == [2, 2]
     assert after["gap_history"][0]["filled_at"] is not None
     assert after["completed_at"] is not None
+
+
+def test_never_complete_while_content_contains_gap_after_last_seq(client):
+    # is_last 早早声明总数，之后越界片段陆续到达、中间还缺号：
+    # 哪怕结束标记早就见过，正文夹着缺口就绝不能对外说 complete
+    post(client, "A", 1, "第一句", is_last=True)
+    post(client, "A", 2, "第二句")              # 越过 is_last 声明的序号
+    r = post(client, "A", 4, "第四句")          # 第 3 段缺失
+    s = r["session"]
+    assert s["status"] == "incomplete"
+    assert s["gaps"] == [[3, 3]]
+    assert "[缺口:片段3]" in s["content"]
+    assert s["completed_at"] is None
+    assert s["conflicts"] >= 1                  # 越界片段仍计入冲突，不被静默吞掉
+
+    # 缺口补上后才完整，但要看得出曾经缺过
+    post(client, "A", 3, "第三句")
+    after = get(client, "A")
+    assert after["status"] == "complete"
+    assert after["content"] == "第一句\n第二句\n第三句\n第四句"
+    assert after["was_incomplete"] is True
+    assert after["completed_at"] is not None
+    assert after["gap_history"][0]["range"] == [3, 3]
+
+
+def test_gap_history_tracks_range_as_it_shrinks_and_fills(client):
+    # 1,5 到达 → 缺口 [2,4]；补 3 → 缺口裂成 [2,2],[4,4]；再补齐
+    post(client, "A", 1, "一")
+    post(client, "A", 5, "五", is_last=True)
+    assert get(client, "A")["gaps"] == [[2, 4]]
+
+    post(client, "A", 3, "三")
+    mid = get(client, "A")
+    assert mid["status"] == "incomplete"
+    assert mid["gaps"] == [[2, 2], [4, 4]]
+    # 残留缺口段继承原发现时间：查得到 [2,4] 曾经整段缺过
+    ranges_open = [h["range"] for h in mid["gap_history"] if h["filled_at"] is None]
+    assert ranges_open == [[2, 2], [4, 4]]
+
+    post(client, "A", 2, "二")
+    post(client, "A", 4, "四")
+    done = get(client, "A")
+    assert done["status"] == "complete"
+    assert done["gaps"] == []
+    assert done["was_incomplete"] is True
+    # 历史行全部关闭，且最早的 [2,4] 整段记录仍在、已带补齐时间
+    assert all(h["filled_at"] for h in done["gap_history"])
+    assert [2, 4] in [h["range"] for h in done["gap_history"]]
+
+
+def test_huge_seq_gap_is_queryable_instantly(client):
+    # 序号空将近一亿个：写入与各查询都必须立即返回，且马上看得出缺着
+    post(client, "BIG", 1, "开头")
+    r = post(client, "BIG", 1_000_000_000, "很远的结尾", is_last=True)
+    s = r["session"]
+    assert s["status"] == "incomplete"
+    assert s["gaps"] == [[2, 999_999_999]]       # 一个区间，没有逐号展开
+    assert "[缺口:片段2-999999999]" in s["content"]
+    assert s["completed_at"] is None
+
+    assert get(client, "BIG")["gaps"] == [[2, 999_999_999]]
+    listed = [x for x in client.get("/sessions").json()["sessions"]
+              if x["call_id"] == "BIG"][0]
+    assert listed["status"] == "incomplete"
+    assert listed["open_gaps"] == [[2, 999_999_999]]
+    # 历史也只有一行（区间），而不是几亿行
+    assert len(get(client, "BIG")["gap_history"]) == 1
+
+
+def test_legacy_per_seq_gap_table_is_migrated(tmp_path):
+    # 旧版 gap_events 按 (call_id, seq) 逐行存，启动时应自动迁成区间表
+    import sqlite3
+
+    db = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE fragments(call_id TEXT, seq INTEGER, text TEXT,
+            first_seen_at TEXT, retransmissions INTEGER DEFAULT 0,
+            PRIMARY KEY(call_id, seq));
+        CREATE TABLE calls(call_id TEXT PRIMARY KEY, first_seen_at TEXT,
+            last_activity_at TEXT, last_seq INTEGER, completed_at TEXT,
+            conflicts INTEGER DEFAULT 0);
+        CREATE TABLE gap_events(call_id TEXT, seq INTEGER, detected_at TEXT,
+            filled_at TEXT, PRIMARY KEY(call_id, seq));
+        INSERT INTO fragments VALUES ('A',1,'一','t',0),('A',4,'四','t',0);
+        INSERT INTO calls VALUES ('A','t','t',4,NULL,0);
+        INSERT INTO gap_events VALUES ('A',2,'d',NULL),('A',3,'d',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(create_app(db)) as c:
+        s = get(c, "A")
+        assert s["status"] == "incomplete"
+        assert s["gaps"] == [[2, 3]]
+        assert s["gap_history"][0]["range"] == [2, 3]
+        # 迁移后继续拼接：补齐缺口 → 完整，历史关闭
+        post(c, "A", 2, "二")
+        post(c, "A", 3, "三")
+        done = get(c, "A")
+        assert done["status"] == "complete"
+        assert done["was_incomplete"] is True
+        assert all(h["filled_at"] for h in done["gap_history"])
 
 
 def test_assembling_when_tail_not_yet_arrived(client):

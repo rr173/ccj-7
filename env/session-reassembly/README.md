@@ -21,13 +21,20 @@
   （只累计 `retransmissions`）；同号不同文视为冲突，保留先到者并计入
   `conflicts`。
 - **缺段不假装完整**：已收到最大序号为 M 时，1..M 中未到的号就是**缺口**。
-  会话状态为三态：
-  - `assembling` —— 目前连续，但还没见到 `is_last`，仍在拼接；
+  判定只看“实际到过的序号”，与 `is_last` 声明在第几号无关——哪怕结束标记
+  早就见过，后来又有越过结束序号的片段到达、正文里仍夹着缺口，也绝不报
+  `complete`（越界片段本身照常计入 `conflicts`）。会话状态为三态：
+  - `assembling` —— 目前连续，但还没见到 `is_last`（或结尾片段还在路上）；
   - `incomplete` —— 中间有缺口，`content` 里嵌显式标记 `[缺口:片段3]`；
-  - `complete` —— 已见 `is_last` 且 1..last_seq 全部到齐。
+  - `complete` —— 已见 `is_last` 且到过的序号连成一片、越过了结束序号。
 - **缺口补上后可见"曾经缺过"**：缺口出现和补齐都记在 `gap_history`
-  （`detected_at` / `filled_at`），记录永不删除；`was_incomplete` 恒为
-  `true`；`version` 单调递增，客户端能发现已发布的视图发生了变化。
+  （按**区间**记录 `range` / `detected_at` / `filled_at`），记录永不删除；
+  缺口缩小时残留段继承原发现时间，整段补齐后历史行关闭但保留；
+  `was_incomplete` 恒为 `true`；`version` 单调递增，客户端能发现已发布的
+  视图发生了变化。
+- **序号空一大截也不卡**：缺口全程以闭区间表示和对账（`gap_events` 同样按
+  区间存储），绝不按序号逐个展开。只收到 1 和 100 亿时，缺口就是一行
+  `[2, 9999999999]`，写入、查询、列表都在毫秒级，且立刻看得出缺着。
 - **重启不散**：全部状态在 SQLite（WAL + `synchronous=FULL`），视图由
   片段表现算，进程重启、容器重建后会话原样恢复，可继续拼接。
 
@@ -42,7 +49,8 @@ GET  /docs                 Swagger UI
 ```
 
 会话视图关键字段：`status`、`content`（拼好的文本，一行一片段）、
-`gaps`（当前缺口区间）、`was_incomplete`、`gap_history`、`version`、
+`gaps`（当前缺口区间列表，如 `[[2,4]]`）、`was_incomplete`、`gap_history`
+（每项含 `range`/`detected_at`/`filled_at`）、`version`、
 `retransmissions`、`conflicts`、`completed_at`。
 
 ### 示例
@@ -98,7 +106,8 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           16 个测试：乱序、重传、通话隔离、缺口、重启持久化
+tests/           23 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/大空洞）、
+                 旧表迁移、重启持久化
 Dockerfile / docker-compose.yml
 ```
 
