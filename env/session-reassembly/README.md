@@ -58,6 +58,17 @@
   重复签收返回 409，首次签收时间不动。稿号带着 `call_id`，拿一通的号
   签不到另一通的稿，两通电话的待签和签收不串。重启后没签完的原样还在；
   老库升级时已有的稿会自动补上待签记录。
+- **已发出的稿按顺序听回去**：回放按**稿号**开始（`POST /drafts/{稿号}
+  /playback`），一稿一条独立进度，从稿的第 1 个拼装单元顺序往后。轮到
+  **发稿当时的缺口**必须停住：状态变 `blocked`、位置不动、`heard` 为空，
+  再推也不前进——不能跳过缺口当成听完。回放单元列表取自 drafts 表那份
+  INSERT-only 快照，所以**后来补上的段不会让这条回放突然变完整**：旧稿
+  仍停在当时的缺口前，要听补齐后的内容得另发新稿、另开一条回放，两条
+  回放互不干扰（旧稿继续 blocked，新稿可一路 finished）。进度落 SQLite，
+  听到哪重启后还停在那儿；重复“开始”只回到当前进度，绝不重头再听。
+  稿号自带 `call_id`，按通话列出（`GET /sessions/{call_id}/playbacks`）
+  也带 `call_id` 过滤，两通电话的回放物理上不串。回放代码路径只写新的
+  `playbacks` 表、只读 `drafts`：**不把稿改掉，也不把待签签掉**。
 
 ## API
 
@@ -72,6 +83,10 @@ GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当
 POST /drafts/{draft_no}/receipt        按稿号签收（201；已签过 409；未知稿号 404）
 GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
 GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
+POST /drafts/{draft_no}/playback       拿稿号开始回放（首次 201；已开始 200 且只回当前进度）
+GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
+POST /drafts/{draft_no}/playback/advance  按顺序听下一段（blocked 时位置不动）
+GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -92,6 +107,15 @@ GET  /docs                             Swagger UI
 `status`（`pending` 待签 / `signed` 已签）、`issued_at`（发稿时间）、
 `signed_at`（签收时间，未签为 `null`）、`draft`（当时那一稿的完整快照——
 正文、缺口原样嵌在签收单里，不随后续片段变化）。
+
+回放（playback）关键字段：`draft_no`/`call_id`/`draft_seq`（听的是哪稿）、
+`status`（`playing` 下一段是正常片段 / `blocked` 轮到发稿当时的缺口、停住 /
+`finished` 这稿快照已按序听完 / `not_started` 还没拿稿号开始）、`position`
+（已听到第几个拼装单元，下次从这里继续）、`total_units`、`next`（下一个单元：
+正常片段为 `{seq,text}`，缺口为 `{gap:[lo,hi],marker}`，末尾为 `null`）、
+`heard`（仅推进响应：本次刚听到的片段；停在缺口或已听完为 `null`）、
+`started_at`/`updated_at`/`finished_at`、`draft`（回放所基于的当时那稿快照）。
+回放只新增 `playbacks` 进度，从不修改 `drafts`，也不触碰 `receipts`。
 
 ### 示例
 
@@ -149,6 +173,41 @@ curl localhost:8000/drafts/C1-D0001/receipt
 curl localhost:8000/sessions/C1/receipts
 ```
 
+### 按顺序听回去
+
+```bash
+# 缺第 3 段时已对外给过 C1-D0001（正文含 [缺口:片段3]）
+# 拿稿号开始听，从第 1 段顺序往后
+curl -X POST localhost:8000/drafts/C1-D0001/playback
+# {"status":"playing","position":0,"total_units":4,"next":{"seq":1,"text":"你好"},...}
+
+curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
+# {"status":"playing","position":1,"heard":{"seq":1,"text":"你好"},
+#  "next":{"seq":2,"text":"听得到吗"},...}
+curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
+# {"status":"blocked","position":2,"heard":null,
+#  "next":{"gap":[3,3],"marker":"[缺口:片段3]"},...}   # 轮到当时的缺口，停住
+
+# 再推也不动：不能跳过缺口当成听完
+curl -X POST localhost:8000/drafts/C1-D0001/playback/advance
+# 仍 {"status":"blocked","position":2,...}
+
+# 缺口后来补上、会话已 complete —— 但这条旧回放不会突然变完整，仍停在缺口前；
+# 补齐后另发了新稿 C1-D0002，想听完整内容得拿新稿号另开一条回放
+curl -X POST localhost:8000/drafts/C1-D0002/playback
+# 两条回放互不干扰：旧稿继续 blocked，新稿从 0 开始可一路 finished
+
+# 听到哪了（重启后仍是这个位置）；重复“开始”只回到当前进度，绝不重头
+curl localhost:8000/drafts/C1-D0001/playback
+# {"status":"blocked","position":2,...}
+
+# 该通话已开始的全部回放（按发稿顺序），列不出另一通电话的回放
+curl localhost:8000/sessions/C1/playbacks
+```
+
+回放只读稿快照、只写自己的进度：`GET /drafts/C1-D0001` 拿到的稿一字不变，
+`GET /drafts/C1-D0001/receipt` 仍是 `pending`——听稿不改稿、不签收。
+
 ## 运行
 
 ### Docker
@@ -179,10 +238,12 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           43 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           52 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
-                 两通电话隔离、重启后稿不丢，以及签收（待签钉住、按号签收、
-                 不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单）
+                 两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
+                 不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
+                 以及回放（顺序收听、缺口停住不跳过、补段不让旧稿变完整、
+                 新旧稿两条回放独立、两通电话不串、重启停在原处、不改稿不签收）
 Dockerfile / docker-compose.yml
 ```
 

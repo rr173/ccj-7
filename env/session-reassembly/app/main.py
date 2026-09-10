@@ -10,6 +10,10 @@
     POST /drafts/{draft_no}/receipt        按稿号签收（同一份不能签两次：409）
     GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
     GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
+    POST /drafts/{draft_no}/playback       拿稿号开始回放（已开始则只回到当前进度，不重头）
+    GET  /drafts/{draft_no}/playback       听到哪了（未开始 409；未知稿号 404）
+    POST /drafts/{draft_no}/playback/advance  按顺序听下一段：轮到当时的缺口就停住
+    GET  /sessions/{call_id}/playbacks     该通话已开始的全部回放（按发稿顺序）
     GET  /healthz                          健康检查
 """
 
@@ -17,7 +21,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from .models import FragmentIn
 from .store import Store
@@ -29,7 +33,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.2.0",
+        version="1.3.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -108,6 +112,57 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if receipts is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"receipts": receipts}
+
+    # -------------------------------------------------------------- 回放
+
+    @app.post("/drafts/{draft_no}/playback")
+    def start_playback(draft_no: str, response: Response):
+        """拿稿号开始听，从这一稿的第 1 个单元顺序往后。
+
+        回放读的是发稿那一刻钉死的快照：后来补段不会让它变完整，轮到稿里
+        当时的缺口必须停住。已经开始过则幂等回到当前进度，绝不重头再听。
+        首次开始 201；已存在 200；未知稿号 404。
+        """
+        playback, started = store.start_playback(draft_no)
+        if playback is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        response.status_code = 201 if started else 200
+        return playback
+
+    @app.post("/drafts/{draft_no}/playback/advance")
+    def advance_playback(draft_no: str):
+        """按顺序听下一个单元。
+
+        轮到正常片段就前进并返回听到的那段；下一个是发稿当时的缺口就停住
+        （status=blocked，位置不动，不跳过）；到末尾 finished。还没开始
+        回放 → 409；未知稿号 → 404。
+        """
+        playback = store.advance_playback(draft_no)
+        if playback is None:
+            # 区分“号不存在”与“还没开始”，错误信息不误导调用方
+            if store.get_draft(draft_no) is None:
+                raise HTTPException(status_code=404, detail="unknown draft_no")
+            raise HTTPException(status_code=409, detail="playback not started")
+        return playback
+
+    @app.get("/drafts/{draft_no}/playback")
+    def get_playback(draft_no: str):
+        """听到哪了。进度落 SQLite，重启后还停在那儿。未开始 409。"""
+        playback = store.get_playback(draft_no)
+        if playback is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if playback["status"] == "not_started":
+            raise HTTPException(status_code=409, detail="playback not started")
+        return playback
+
+    @app.get("/sessions/{call_id}/playbacks")
+    def list_playbacks(call_id: str):
+        """该通话已开始的全部回放（按发稿顺序）。查询带 call_id，
+        结构上列不出另一通电话的回放。"""
+        playbacks = store.list_playbacks(call_id)
+        if playbacks is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"playbacks": playbacks}
 
     @app.get("/healthz")
     def healthz():

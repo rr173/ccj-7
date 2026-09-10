@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-四张表：
+六张表：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -20,6 +20,14 @@
                IS NULL 条件，重复签收影响 0 行），同一份签不了两次。
                签收单本身不复制正文 —— 它引用 drafts 里那份永不修改的
                快照，所以待签期间取出，看到的仍是发稿那一刻的正文和缺口。
+- playbacks  : 已发稿的回放进度，一稿一条，按**稿号**开始。位置 position
+               是“已听过的拼装单元数”，下一个要听的单元即 parts[position]。
+               回放只读 drafts 里发稿那一刻钉死的 parts —— 后来补段、重传、
+               出新稿都碰不到它：稿里当时是缺口的地方，回放轮到就停住
+               （blocked），推进无效、位置不动，绝不跳过去当成听完；后来补
+               上的段也不会让这条旧稿的回放突然变完整（要听补齐后的内容得
+               另发新稿、另开一条回放）。本表只记录进度，永不写 drafts /
+               receipts —— 回放既不改稿，也不会把待签签掉。
 """
 
 from __future__ import annotations
@@ -31,6 +39,12 @@ import threading
 from datetime import datetime, timezone
 
 from . import reassembly as R
+
+# 回放状态
+PB_PLAYING = "playing"          # 正在顺序收听，下一个单元是正常片段
+PB_BLOCKED = "blocked"          # 下一个单元是发稿当时的缺口，停住等
+PB_FINISHED = "finished"        # 这一稿快照里的拼装单元已按序听完
+PB_NOT_STARTED = "not_started"  # 稿在，但还没拿稿号开始过回放
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -81,6 +95,15 @@ CREATE TABLE IF NOT EXISTS receipts (
     created_at TEXT NOT NULL,     -- 进入待签的时刻（= 发稿时间）
     signed_at  TEXT               -- NULL = 待签；签收时刻，写下后不再改
 );
+CREATE TABLE IF NOT EXISTS playbacks (
+    draft_no   TEXT PRIMARY KEY REFERENCES drafts(draft_no),  -- 一稿一条回放
+    call_id    TEXT NOT NULL,     -- 冗余自稿号所属通话，按通话查/隔离都带着它
+    position   INTEGER NOT NULL DEFAULT 0,  -- 已听过的拼装单元数（0=从头开始）
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,     -- 最后一次成功推进的时刻；停在缺口时不动
+    finished_at TEXT              -- 听到快照末尾的时刻；停在缺口时为 NULL
+);
+CREATE INDEX IF NOT EXISTS idx_playbacks_call ON playbacks(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -476,6 +499,161 @@ class Store:
                 (call_id,),
             ).fetchall()
             return [self._receipt_view(r, self.get_draft(r["draft_no"])) for r in rows]
+
+    # ------------------------------------------------------------------ 回放
+
+    def start_playback(self, draft_no: str) -> tuple[dict | None, bool]:
+        """拿稿号开始（或回到）一条回放，返回 (回放视图, 是否本次新开始)。
+
+        位置只在**第一次**开始时建立（position=0）：之后再调只是取出当前
+        进度，绝不会把“听到哪了”拨回开头。未知稿号返回 (None, False)。
+        """
+        with self._lock, self._conn:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None, False
+            now = _now()
+            cur = self._conn.execute(
+                "INSERT INTO playbacks(draft_no, call_id, position, started_at, updated_at)"
+                " VALUES(?,?,0,?,?)"
+                " ON CONFLICT(draft_no) DO NOTHING",
+                (draft_no, draft["call_id"], now, now),
+            )
+            started = cur.rowcount > 0
+            return self.get_playback(draft_no), started
+
+    def advance_playback(self, draft_no: str) -> dict | None:
+        """按顺序往下听一个拼装单元。
+
+        - 下一个单元是正常片段：position 前进一格，返回该片段（heard）；
+        - 下一个单元是**发稿当时的缺口**：停住 —— 不前进、不跳过，状态
+          blocked，position 原封不动，updated_at 也不动；
+        - 已到快照末尾：finished，重复推进无效；
+        - 还没开始 / 稿号未知：None（由 API 区分 409 / 404）。
+        单元列表取自 drafts 表那份永不修改的快照，所以“后来补上的段”
+        永远进不到这条回放里 —— 缺口前不会突然变完整。
+        """
+        with self._lock, self._conn:
+            pb = self._conn.execute(
+                "SELECT position FROM playbacks WHERE draft_no=?", (draft_no,)
+            ).fetchone()
+            if pb is None:
+                return None
+            draft = self.get_draft(draft_no)  # 只读快照；本方法不写 drafts
+            parts = draft["parts"]
+            pos = pb["position"]
+            heard = None
+            if pos < len(parts) and "text" in parts[pos]:
+                pos += 1
+                heard = parts[pos - 1]
+                now = _now()
+                if pos >= len(parts):
+                    self._conn.execute(
+                        "UPDATE playbacks SET position=?, updated_at=?,"
+                        " finished_at=COALESCE(finished_at, ?) WHERE draft_no=?",
+                        (pos, now, now, draft_no),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE playbacks SET position=?, updated_at=? WHERE draft_no=?",
+                        (pos, now, draft_no),
+                    )
+            # 缺口（"gap" in part）或已到末尾：条件不成立，什么都不写。
+            return self._playback_view(self._get_playback_row(draft_no), draft, heard)
+
+    @staticmethod
+    def _playback_state(parts: list[dict], position: int) -> str:
+        if position >= len(parts):
+            return PB_FINISHED
+        return PB_BLOCKED if "gap" in parts[position] else PB_PLAYING
+
+    def _playback_view(
+        self, pb: sqlite3.Row | None, draft: dict | None = None, heard: dict | None = None
+    ) -> dict | None:
+        """把 playbacks 行 + drafts 快照装成回放视图。
+
+        稿号未知返回 None；稿在但还没开始（playbacks 无行）由调用方决定如何
+        表达 —— 本方法只服务已经开始的回放。视图里嵌整份稿快照，是同一份
+        只读数据的呈现，回放推进不改它一个字。
+        """
+        if pb is None:
+            return None
+        if draft is None:
+            draft = self.get_draft(pb["draft_no"])
+        parts = draft["parts"]
+        pos = pb["position"]
+        state = self._playback_state(parts, pos)
+        view = {
+            "draft_no": draft["draft_no"],
+            "call_id": draft["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "status": state,
+            "position": pos,              # 已听到第几个单元（下次从这里继续）
+            "total_units": len(parts),
+            "started_at": pb["started_at"],
+            "updated_at": pb["updated_at"],
+            "finished_at": pb["finished_at"],
+            "next": None,                 # 下一个要听的单元；末尾为 null
+            "heard": heard,               # 本次推进刚听到的片段（仅推进响应）
+            "draft": draft,               # 发稿那一刻的快照，永不被回放改动
+        }
+        if pos < len(parts):
+            unit = parts[pos]
+            if "gap" in unit:
+                # 轮到当时的缺口：明确告诉调用方卡在哪、为什么过不去
+                view["next"] = {"gap": unit["gap"], "marker": unit["marker"]}
+            else:
+                view["next"] = {"seq": unit["seq"], "text": unit["text"]}
+        return view
+
+    def _get_playback_row(self, draft_no: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM playbacks WHERE draft_no=?", (draft_no,)
+        ).fetchone()
+
+    def get_playback(self, draft_no: str) -> dict | None:
+        """按稿号取一条**已开始**的回放及当前进度。
+
+        稿号未知 → None（404）；稿在但还没开始 → status=not_started 的视图
+        （409 语义：还没拿稿号开始过）。"""
+        with self._lock:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None
+            pb = self._get_playback_row(draft_no)
+            if pb is None:
+                return {
+                    "draft_no": draft["draft_no"],
+                    "call_id": draft["call_id"],
+                    "draft_seq": draft["draft_seq"],
+                    "status": PB_NOT_STARTED,
+                    "position": 0,
+                    "total_units": len(draft["parts"]),
+                    "started_at": None,
+                    "updated_at": None,
+                    "finished_at": None,
+                    "next": None,
+                    "heard": None,
+                    "draft": draft,
+                }
+            return self._playback_view(pb, draft)
+
+    def list_playbacks(self, call_id: str) -> list[dict] | None:
+        """某通电话上**已经开始**的全部回放（按发稿顺序）。
+
+        查询本身带着 call_id，结构上列不出另一通电话的回放；没开始过的稿
+        不占行（要开始得拿稿号）。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT p.* FROM playbacks p JOIN drafts d ON d.draft_no = p.draft_no"
+                " WHERE p.call_id=? ORDER BY d.draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._playback_view(r, self.get_draft(r["draft_no"])) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对
