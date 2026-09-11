@@ -1959,7 +1959,11 @@ class Store:
                     (new_call_id, bridge_no),
                 )
             except sqlite3.IntegrityError:
-                # 触发器兜底：并发下换上来的通话刚进了别的活动桥
+                # 触发器/唯一索引兜底：并发下换上来的通话刚进了别的活动桥。
+                # 整笔回滚 —— 上面那笔留痕 INSERT 一起撤掉：桥没换成，
+                # 历史里就不能留下“换过”的这一笔（否则它会随库持久化，
+                # 重启后还在）。
+                self._conn.rollback()
                 return None, "already_bridged"
             row = self._conn.execute(
                 "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)

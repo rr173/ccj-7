@@ -423,6 +423,65 @@ def test_database_trigger_blocks_swap_into_occupied_call(client):
     assert v["left_call_id"] == "A" and v["right_call_id"] == "B"
 
 
+# ------------------------------------------------------------- 并发竞态
+
+def test_lost_swap_race_leaves_no_history(tmp_path):
+    """两座活动桥同一时刻把同一通电话换上来：赢家换成并留痕；输家被
+    触发器兜底拦下（already_bridged），两边不动 —— 也绝不能留下
+    “换过”的记录，重启后同样没有。"""
+    from unittest.mock import patch
+
+    from app.store import Store
+
+    db = str(tmp_path / "race.db")
+    s1 = Store(db)
+    s2 = Store(db)  # 同库的另一个实例（另一进程/另一连接）
+    try:
+        for cid in ("A", "B", "C", "D", "E"):
+            s1.ingest(cid, 1, f"{cid}1")
+        s1.create_bridge("A", "B")   # B0001
+        s1.create_bridge("C", "D")   # B0002
+
+        # 竞态窗口：s2 做“E 是否在别的活动桥”检查时，s1 的换边还没提交，
+        # 看到的是 E 仍自由；等 s2 落笔 UPDATE 时由数据库触发器兜底
+        with patch.object(s2, "_active_bridge_row", lambda call_id: None):
+            b1, r1 = s1.swap_bridge_side("B0001", "left", "E")
+            assert r1 == "swapped"
+            b2, r2 = s2.swap_bridge_side("B0002", "left", "E")
+        assert r2 == "already_bridged" and b2 is None
+
+        # 输家桥上两边还是原来的人
+        v2 = s2.get_bridge("B0002")
+        assert v2["left_call_id"] == "C" and v2["right_call_id"] == "D"
+        # 没换成，历史里就不能有这笔
+        assert v2["swap_count"] == 0 and v2["swaps"] == []
+        assert s2.get_bridge_swaps("B0002")["swap_count"] == 0
+        # E 只上成了 B0001，不在 B0002 的“上过的桥”里
+        e_bridges = {b["bridge_no"]: b for b in s2.list_bridges_for_call("E")}
+        assert e_bridges["B0001"]["currently_on_bridge"] is True
+        assert "B0002" not in e_bridges
+        # C 也没被记成“换下去过”
+        c_bridges = {b["bridge_no"]: b for b in s2.list_bridges_for_call("C")}
+        assert c_bridges["B0002"]["currently_on_bridge"] is True
+    finally:
+        s1.close()
+        s2.close()
+
+    # 重启之后：换成的那座记录还在；没换成的那座依然一笔不多
+    s3 = Store(db)
+    try:
+        v1 = s3.get_bridge("B0001")
+        assert v1["left_call_id"] == "E" and v1["swap_count"] == 1
+        assert v1["swaps"][0]["old_call_id"] == "A"
+        assert v1["swaps"][0]["new_call_id"] == "E"
+        v2 = s3.get_bridge("B0002")
+        assert v2["left_call_id"] == "C" and v2["right_call_id"] == "D"
+        assert v2["swap_count"] == 0 and v2["swaps"] == []
+        assert s3.get_bridge_swaps("B0002")["swaps"] == []
+    finally:
+        s3.close()
+
+
 # ------------------------------------------------------------- 重启
 
 def test_swapped_bridge_survives_restart(tmp_path):
