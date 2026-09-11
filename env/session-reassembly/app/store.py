@@ -3,7 +3,8 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十四张表（前十一张业务表 + holds 压稿表 + bridges 桥表 + bridge_swaps 换边留痕表）：
+十五张表（前十一张业务表 + holds 压稿表 + bridges 桥表 + bridge_swaps 换边留痕表 +
+bridge_photos 桥拍照留痕表）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -105,6 +106,18 @@
                另一通 —— bridges 表的 BEFORE UPDATE 触发器和两条部分唯一索引
                在同一事务里兜底（IntegrityError）。已经拆掉的桥不能再换边；
                换边记录落 SQLite，重启后现行对齐按新两边对得上，历次换边都查得到。
+- bridge_photos : 桥的拍照留痕 —— 桥还搭着时，随时可以把**此刻**两边对到哪一对
+               拍下来。一座桥可以拍好几次，每笔按 (bridge_no, photo_seq) 记“这座
+               桥第几次拍”（从 1 递增），并把拍照那一刻两边身份与逐对对齐整体
+               快照进 snapshot_json（与换边前的 before、拆桥快照同一套内容）。
+               本表只 INSERT，绝不 UPDATE/DELETE：拍完之后两通再来新段、缺口补齐
+               都只让活动桥的**现行**对齐继续现算，旧照片一个字不变 —— 第几张拍
+               的、当时对到哪一对，事后永远查得到。拍照不写、不改、不删任何
+               fragments，也不碰 bridges 行本身（桥上此刻还在算的对齐照旧现算）。
+               **已经拆掉的桥不能再拍**（拍照只对 active 的桥开放；拆时冻结对齐
+               另有 bridges.snapshot_json 留痕），但拆前拍过的照片拆后照样可查、
+               仍是拍时那份。照片落 SQLite，服务再起来拍过的还在，活动桥的现行
+               对齐仍按两边现在的段来算。
 """
 
 from __future__ import annotations
@@ -311,6 +324,19 @@ CREATE INDEX IF NOT EXISTS idx_bridge_swaps_no ON bridge_swaps(bridge_no);
 -- 按通话查“上过的桥”时，换下去/换上来的经过也要带 call_id 查得到
 CREATE INDEX IF NOT EXISTS idx_bridge_swaps_old ON bridge_swaps(old_call_id);
 CREATE INDEX IF NOT EXISTS idx_bridge_swaps_new ON bridge_swaps(new_call_id);
+-- 桥拍照留痕：一行一张照片，只插不改。snapshot_json 钉住拍照**那一刻**两边
+-- 的身份与逐对对齐，拍完之后两通再来新段、继续换边、乃至拆桥都只动别处，
+-- 这一行一个字不动 —— “第几张拍的、当时对到哪一对”事后永远查得到。只有
+-- 还搭着的桥能拍（已拆的桥拒绝，拆时对齐另有 bridges.snapshot_json 冻结）。
+CREATE TABLE IF NOT EXISTS bridge_photos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,  -- 拍照先后（全局顺序）
+    bridge_no     TEXT NOT NULL REFERENCES bridges(bridge_no),  -- 拍的是哪座桥
+    photo_seq     INTEGER NOT NULL,   -- 这座桥第几次拍，从 1 递增（同桥不重号）
+    taken_at      TEXT NOT NULL,      -- 拍照时刻
+    snapshot_json TEXT NOT NULL,      -- 拍照时两边身份与逐对对齐的完整快照
+    UNIQUE (bridge_no, photo_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_bridge_photos_no ON bridge_photos(bridge_no);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1787,6 +1813,11 @@ class Store:
         swaps = self._swap_rows(r["bridge_no"])
         view["swap_count"] = len(swaps)
         view["swaps"] = [self._swap_view(s) for s in swaps]
+        photos = self._photo_rows(r["bridge_no"])
+        # 这座桥拍过几次、每张拍时对到哪一对：照片只插不改，现行对齐现算也好、
+        # 桥已拆也好，这里带出的永远是各张照片自己拍时那份冻结的对齐
+        view["photo_count"] = len(photos)
+        view["photos"] = [self._photo_view(p) for p in photos]
         return view
 
     def create_bridge(
@@ -1985,6 +2016,110 @@ class Store:
                 "bridge_no": bridge_no,
                 "swap_count": len(rows),
                 "swaps": [self._swap_view(x) for x in rows],
+            }
+
+    # ------------------------------------------------------------ 桥拍照
+
+    def _photo_rows(self, bridge_no: str) -> list[sqlite3.Row]:
+        """这座桥拍过的全部照片行（按拍照先后，即第几张）。只插不改。"""
+        return self._conn.execute(
+            "SELECT * FROM bridge_photos WHERE bridge_no=? ORDER BY photo_seq",
+            (bridge_no,),
+        ).fetchall()
+
+    def _photo_view(self, r: sqlite3.Row) -> dict:
+        """一张照片的对外视图：身份（哪座桥、第几张、何时拍）+ 拍照那一刻
+        两边身份与逐对对齐的完整快照。快照来自只插不改的 bridge_photos 行，
+        拍完后两通再来新段、换边、拆桥都碰不到它。"""
+        snap = json.loads(r["snapshot_json"])
+        return {
+            "bridge_no": r["bridge_no"],
+            "photo_seq": r["photo_seq"],
+            "taken_at": r["taken_at"],
+            # 拍照那一刻左右各是哪通（换边之后旧照片仍指得出拍时的两边）
+            "left_call_id": snap["left"]["call_id"],
+            "right_call_id": snap["right"]["call_id"],
+            # 拍照那一刻对齐到哪一对：逐对单元 + 进度汇总，钉死不动
+            "left": snap["left"],
+            "right": snap["right"],
+            "pairs": snap["pairs"],
+            "aligned_count": snap["aligned_count"],
+            "gap_count": snap["gap_count"],
+            "total_pairs": snap["total_pairs"],
+            "aligned_up_to": snap["aligned_up_to"],
+            "gaps": snap["gaps"],
+        }
+
+    def take_bridge_photo(self, bridge_no: str) -> tuple[dict | None, str]:
+        """给一座**还搭着**的桥拍一张照，返回 (照片视图, 结果)。结果为：
+
+        - ``"taken"``：本次拍下（按这座桥第几次拍发 photo_seq，从 1 递增）；
+        - ``"dismantled"``：桥已经拆了 —— 已经拆掉的桥不能再拍（拆时对齐
+          另有 bridges.snapshot_json 留痕）；拆前拍过的照片照样还在；
+        - ``"unknown"``：桥号不存在，视图为 None。
+
+        拍照只做两件事：按**现行**两边 fragments 现算一次对齐（与活动桥 GET
+        完全同源），再把它连同“第几张、何时拍”INSERT 进 bridge_photos。绝不
+        UPDATE/DELETE：拍完之后两通再来新段、缺口补齐只改变活动桥的现行对齐，
+        这张照片一个字不动；也不写不改任何 fragments、不碰 bridges 行 ——
+        两通各自的会话、桥上此刻还在算的对齐都不受拍照影响。同一座桥可以拍
+        好几次，照片落 SQLite，重启后拍过的仍在。
+        """
+        with self._lock, self._conn:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if r is None:
+                return None, "unknown"
+            if r["status"] == BR_DISMANTLED:
+                # 已拆的桥不能再拍：不产生任何照片；拆前拍过的照片不受影响
+                return None, "dismantled"
+            # 拍前按现行两边最后算一次对齐 —— “此刻两边对到哪一对”整体钉进
+            # bridge_photos，之后新段怎么到都与这张照片无关
+            snapshot = self._compute_alignment(r["left_call_id"], r["right_call_id"])
+            n_photos = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM bridge_photos WHERE bridge_no=?",
+                (bridge_no,),
+            ).fetchone()["n"]
+            photo_seq = n_photos + 1
+            now = self._now()
+            self._conn.execute(
+                "INSERT INTO bridge_photos(bridge_no, photo_seq, taken_at, snapshot_json)"
+                " VALUES(?,?,?,?)",
+                (bridge_no, photo_seq, now,
+                 json.dumps(snapshot, ensure_ascii=False)),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM bridge_photos WHERE bridge_no=? AND photo_seq=?",
+                (bridge_no, photo_seq),
+            ).fetchone()
+            return self._photo_view(row), "taken"
+
+    def get_bridge_photo(self, bridge_no: str, photo_seq: int) -> dict | None:
+        """取一座桥的某一张照片（按这座桥第几张）。桥号不存在、没拍过这么
+        多张都返回 None。照片内容取自只插不改的快照，永远是拍时那份对齐。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM bridge_photos WHERE bridge_no=? AND photo_seq=?",
+                (bridge_no, photo_seq),
+            ).fetchone()
+            return None if r is None else self._photo_view(r)
+
+    def list_bridge_photos(self, bridge_no: str) -> dict | None:
+        """一座桥拍过的全部照片（按拍照先后，即第 1 张、第 2 张……）。每张都
+        看得出是第几次拍、拍时两边各是谁、当时对到哪一对。未知桥号返回
+        None（活动桥、已拆桥都能列：拆后不能再拍，但旧照片照样可查）。"""
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = self._photo_rows(bridge_no)
+            return {
+                "bridge_no": bridge_no,
+                "photo_count": len(rows),
+                "photos": [self._photo_view(r) for r in rows],
             }
 
     def get_bridge(self, bridge_no: str) -> dict | None:

@@ -40,6 +40,9 @@
     POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立，对齐进度留痕；已拆 409）
     POST /bridges/{bridge_no}/swap           桥还搭着时换掉其中一边（桥号不变、按新两边重新对齐；旧两边与旧对齐留痕）
     GET  /bridges/{bridge_no}/swaps          这座桥历次换边的留痕（换下/换上/不动各是谁、何时换、换边前对齐）
+    POST /bridges/{bridge_no}/photos         桥还搭着时拍一张照（钉住此刻两边对到哪一对；已拆 409）
+    GET  /bridges/{bridge_no}/photos         这座桥拍过的全部照片（第几张、何时拍、拍时对齐）
+    GET  /bridges/{bridge_no}/photos/{n}     这座桥的第 n 张照片（永远是拍时那份对齐）
     GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的也在）
     GET  /healthz                            健康检查
 
@@ -65,7 +68,7 @@ def create_app(
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.11.0",
+        version="1.12.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -569,6 +572,47 @@ def create_app(
         if swaps is None:
             raise HTTPException(status_code=404, detail="unknown bridge_no")
         return swaps
+
+    # -------------------------------------------------------------- 桥拍照
+
+    @app.post("/bridges/{bridge_no}/photos", status_code=201)
+    def take_bridge_photo(bridge_no: str):
+        """桥还搭着时，把此刻两边对到哪一对拍下来。
+
+        同一座桥可以拍好几次：响应带 photo_seq（这座桥第几张，从 1 递增），
+        每张都钉着拍照那一刻两边各是谁、逐对对齐到哪、缺口缺哪一边。拍照只
+        新增记录：之后两通再来新段、缺口补齐，只让活动桥的现行对齐继续现算，
+        这张照片一个字不变；拍照也不改两通各自的会话。已拆掉的桥不能再拍
+        （409，拆时对齐另有拆桥快照留痕）；未知桥号 404。照片落库，服务重启
+        后拍过的仍在。
+        """
+        photo, result = store.take_bridge_photo(bridge_no)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        if result == "dismantled":
+            raise HTTPException(status_code=409, detail="bridge already dismantled")
+        return photo
+
+    @app.get("/bridges/{bridge_no}/photos")
+    def list_bridge_photos(bridge_no: str):
+        """这座桥拍过的全部照片（按拍照先后）：每张看得出是第几张、何时拍、
+        拍时两边各是谁、当时对到哪一对。拍完后再来的段碰不到旧照片。活动桥、
+        已拆桥都能列（拆后不能再拍，但拆前拍过的照片照样查得到）。
+        未知桥号 404。"""
+        photos = store.list_bridge_photos(bridge_no)
+        if photos is None:
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        return photos
+
+    @app.get("/bridges/{bridge_no}/photos/{photo_seq}")
+    def get_bridge_photo(bridge_no: str, photo_seq: int):
+        """取这座桥的某一张照片（按第几张）：永远是拍照那一刻的两边身份与
+        逐对对齐，后来补段、换边、拆桥都不改它。没拍过这么多张/未知桥号
+        404。"""
+        photo = store.get_bridge_photo(bridge_no, photo_seq)
+        if photo is None:
+            raise HTTPException(status_code=404, detail="unknown bridge photo")
+        return photo
 
     @app.get("/sessions/{call_id}/bridges")
     def list_bridges_for_call(call_id: str):

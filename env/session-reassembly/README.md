@@ -159,8 +159,20 @@
 - **服务再起来，没拆的桥还在、对齐还对得上**：桥行、拆桥快照都落 SQLite
   （WAL + `synchronous=FULL`）。重启后活动桥仍是 `active`，按到过的序号
   重新现算对齐；已拆桥仍是拆时的冻结快照；活动桥唯一约束重启后继续生效。
-- **桥还搭着可以换掉其中一边**：`POST /bridges/{桥号}/swap` 指明换哪一边
-  （`side=left|right`）和换上来的通话。**换完还是这座桥**——桥号不变、状态
+- **桥还搭着时可以把此刻的对齐拍下来**：`POST /bridges/{桥号}/photos` 给一座
+  **还搭着**的桥拍一张照，把**那一刻**两边身份与逐对对齐（`pairs`、
+  `aligned_up_to`、`gaps`、各对两边的字）整体快照进 `bridge_photos` 表（只插
+  不改），发照片序号 `photo_seq`——**同一座桥可以拍好几次**，每张看得出是第几张、
+  何时拍、当时对到哪一对。拍完之后两通再来新段、缺口补齐，只让活动桥的**现行**
+  对齐继续现算，旧照片一个字不变（`GET /bridges/{桥号}/photos` 列全部，
+  `GET /bridges/{桥号}/photos/{n}` 取第 n 张）。拍照不写、不改、不删两通各自的
+  片段/会话，也不碰 `bridges` 行——桥上此刻还在算的对齐照旧按两边现在的段现算；
+  桥视图里带 `photo_count`/`photos`，每张照片都嵌着自己拍时那份冻结对齐。
+  **已经拆掉的桥不能再拍**（409；拆时对齐另有拆桥快照留痕），但拆前拍过的照片
+  拆后照样可查、仍是拍时那份；换边后旧照片仍钉着拍照当时的旧两边和旧对齐，不被
+  新两边盖掉。照片落 SQLite：**服务再起来，拍过的还在，现行对齐仍按两边现在的
+  段来算**。
+- **桥还搭着可以换掉其中一边**：`POST /bridges/{桥号}/swap` 指明换哪一边  （`side=left|right`）和换上来的通话。**换完还是这座桥**——桥号不变、状态
   仍 `active`，现行对齐立刻按**新的两边**重新现算；被换下去的那通**恢复
   自由**（会话视图 `active_bridge` 清空，可再搭新桥、日后也能再被换回来），
   它的片段一个不删不改。换上来的那通必须是**已经有片段**的非空通话，且
@@ -221,6 +233,9 @@ GET  /bridges/{bridge_no}                按桥号取桥：两边身份、逐对
 POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立、对齐进度冻结留痕；已拆 409；未知桥号 404）
 POST /bridges/{bridge_no}/swap           换掉活动桥的其中一边（201；已拆 409；空通话/桥上现有两边/已在别的活动桥 409；未知通话 404；未知桥号 404）
 GET  /bridges/{bridge_no}/swaps          这座桥历次换边的留痕（第几次、换哪边、换下/换上/不动各是谁、换边前的旧对齐）
+POST /bridges/{bridge_no}/photos         桥还搭着时拍一张照（201，钉住此刻两边对到哪一对；已拆 409；未知桥号 404）
+GET  /bridges/{bridge_no}/photos         这座桥拍过的全部照片（第几张、何时拍、拍时两边与逐对对齐）
+GET  /bridges/{bridge_no}/photos/{n}     取这座桥的第 n 张照片（永远是拍时那份；没拍过/未知桥号 404）
 GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的带 currently_on_bridge=false；未知通话 404）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
@@ -308,7 +323,12 @@ GET  /docs                             Swagger UI
 `total_pairs`、`aligned_up_to`（连续对齐前缀，"当时对齐到哪一对"）、
 `gaps`（缺口区间列表）、`swap_count`/`swaps`（换过几次边及历次留痕：每项含
 `swap_seq`/`side`/`old_call_id`/`new_call_id`/`other_call_id`/`swapped_at`/
-`before`，`before` 是换边**前**旧两边身份与逐对对齐的完整快照，只插不改）。
+`before`，`before` 是换边**前**旧两边身份与逐对对齐的完整快照，只插不改）、
+`photo_count`/`photos`（桥还搭着时拍下的照片：每张含 `photo_seq` 这是这座桥
+第几张、`taken_at` 何时拍、拍时的 `left_call_id`/`right_call_id` 与逐对对齐
+`left`/`right`/`pairs`/`aligned_count`/`gap_count`/`total_pairs`/
+`aligned_up_to`/`gaps`——只插不改，拍完后两通再来段、换边、拆桥都碰不到旧
+照片；已拆桥不能再拍，但拆前的照片拆后仍在）。
 活动桥这些对齐字段按当前两边片段**现算**；拆桥时把当时的全套值冻结进桥行，
 之后两通再收段也不变。按通话列出时每项还带 `side`（该通最后在这座桥的左边
 还是右边）与 `currently_on_bridge`（现行两边为 `true`，已被换下去为 `false`）。
@@ -647,6 +667,38 @@ curl localhost:8000/bridges/B0001/swaps
 # 桥上现有的两边（409）都换不上来；未知桥号/通话 404。
 ```
 
+### 桥还搭着时把此刻的对齐拍下来
+
+```bash
+# B0001 还搭着：A 到两段、B 到一段（第 2 对缺右）。拍第一张
+curl -X POST localhost:8000/bridges/B0001/photos
+# {"bridge_no":"B0001","photo_seq":1,"taken_at":"...",
+#  "left_call_id":"A","right_call_id":"B",
+#  "aligned_count":1,"aligned_up_to":1,"gaps":[[2,2]],
+#  "pairs":[{"kind":"aligned","seq":1,...},
+#           {"kind":"gap","missing":"right","seq":2,"right":null,...}], ...}
+
+# 拍完之后缺的那边补上：活动桥的现行对齐继续现算（对上 2 对）
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"B","seq":2,"text":"b2"}'
+curl localhost:8000/bridges/B0001            # aligned_up_to=2, photo_count=1
+
+# 再拍一张：看得出这是第 2 张、当时对上 2 对
+curl -X POST localhost:8000/bridges/B0001/photos   # photo_seq=2, aligned_up_to=2
+
+# 第 1 张永远是拍那一刻的样子 —— 后来补的段碰不到它
+curl localhost:8000/bridges/B0001/photos/1
+# {"photo_seq":1,"aligned_up_to":1,"gaps":[[2,2]],
+#  "right":{"call_id":"B","fragment_count":1,...}, ...}   # 拍时 B 只有 1 段
+curl localhost:8000/bridges/B0001/photos      # 这座桥拍过的全部照片（按第几张）
+
+# 拍照不改两通各自的会话，也不动桥上正在算的对齐；拆桥之后不能再拍，
+# 但拆前拍过的照片照样可查（重启后也在）。
+curl -X POST localhost:8000/bridges/B0001/dismantle
+curl -X POST localhost:8000/bridges/B0001/photos     # 409 bridge already dismantled
+curl localhost:8000/bridges/B0001/photos             # 旧照片仍在
+```
+
 ## 运行
 
 ### Docker
@@ -677,7 +729,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           154 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           167 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -709,7 +761,11 @@ tests/           154 个测试：乱序、重传、通话隔离、缺口（含�
                  都换不上、换边只插 bridge_swaps 并 UPDATE 桥列不碰片段、
                  每次换边前旧两边身份与旧对齐快照留痕且不被新两边/拆桥盖掉、
                  按通话列得出换下去的经过、触发器兜底、重启后现行对齐与历次
-                 留痕都还在）
+                 留痕都还在），
+                 桥拍照（搭着时能拍、钉住此刻两边对到哪一对、同一座可拍多张
+                 各带第几张、拍完再来新段旧照片不变而现行对齐继续现算、拍照不
+                 改两通会话也不动桥上现行对齐、已拆的桥不能再拍但拆前照片仍在、
+                 换边后旧照片不被新两边盖掉、两桥各自编号不串、重启后照片还在）
 Dockerfile / docker-compose.yml
 ```
 
