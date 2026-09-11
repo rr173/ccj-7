@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十三张表（前十一张业务表 + holds 压稿表 + bridges 桥表）：
+十四张表（前十一张业务表 + holds 压稿表 + bridges 桥表 + bridge_swaps 换边留痕表）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -94,6 +94,17 @@
                通话和逐对对齐整体快照进 snapshot_json，此后两通继续收段、继续
                发稿都碰不到它 —— “当时对齐到哪一对”留得下来。桥行落 SQLite，
                服务重启后没拆的桥还在，对齐仍按到过的序号对得上。
+- bridge_swaps : 桥的换边留痕 —— 桥还搭着时可以把其中一边换成另一通**已有
+               片段**的电话，桥号不变、按新两边重新对齐。每次换边只往本表
+               INSERT 一行（永不 UPDATE/DELETE）：第几次换、换的是左还是右、
+               换下去/换上来/原地不动的各是哪通、换边时刻，并把**换边前旧两边**
+               的身份与逐对对齐整体快照进 before_json —— 之后再换边、再拆桥
+               都覆盖不了“上一次换边当时旧的两边是谁、对到哪”。换下去的那一
+               通自动恢复自由（bridges 行不再带它，活动桥唯一约束随即放行）；
+               换上来的不能已经待在别的活动桥里，也不能是空通话或桥上现有的
+               另一通 —— bridges 表的 BEFORE UPDATE 触发器和两条部分唯一索引
+               在同一事务里兜底（IntegrityError）。已经拆掉的桥不能再换边；
+               换边记录落 SQLite，重启后现行对齐按新两边对得上，历次换边都查得到。
 """
 
 from __future__ import annotations
@@ -118,6 +129,10 @@ PB_HELD = "held"                # 稿还压着：正文看不见，回放不开�
 # 桥状态
 BR_ACTIVE = "active"            # 还搭着：对齐视图按两边 fragments 现算
 BR_DISMANTLED = "dismantled"    # 已拆：对齐停在拆桥那一刻的快照，不再变
+
+# 桥的两边
+SIDE_LEFT = "left"
+SIDE_RIGHT = "right"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -277,6 +292,25 @@ BEGIN
                OR right_call_id IN (NEW.left_call_id, NEW.right_call_id))
     ) THEN RAISE(ABORT, 'call already in an active bridge') END;
 END;
+-- 桥换边留痕：一行一次换边，只插不改。before_json 钉住换边**前**旧两边的
+-- 身份与逐对对齐，换完之后再换边、再拆桥都只新增/更新别处，这一行一个字
+-- 不动 —— “旧的两边是谁、当时对到哪”事后永远查得到，不被新两边盖掉。
+CREATE TABLE IF NOT EXISTS bridge_swaps (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,  -- 换边先后（全局顺序）
+    bridge_no     TEXT NOT NULL REFERENCES bridges(bridge_no),  -- 哪座桥（桥号不变）
+    swap_seq      INTEGER NOT NULL,   -- 这座桥第几次换边，从 1 递增
+    side          TEXT NOT NULL,      -- 换的是哪一边：left / right
+    old_call_id   TEXT NOT NULL,      -- 被换下去、随即恢复自由的那通
+    new_call_id   TEXT NOT NULL,      -- 换上来的那通（非空、不在别的活动桥里）
+    other_call_id TEXT NOT NULL,      -- 原地不动的另一边那通
+    swapped_at    TEXT NOT NULL,      -- 换边时刻
+    before_json   TEXT NOT NULL,      -- 换边前旧两边身份与逐对对齐的完整快照
+    UNIQUE (bridge_no, swap_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_bridge_swaps_no ON bridge_swaps(bridge_no);
+-- 按通话查“上过的桥”时，换下去/换上来的经过也要带 call_id 查得到
+CREATE INDEX IF NOT EXISTS idx_bridge_swaps_old ON bridge_swaps(old_call_id);
+CREATE INDEX IF NOT EXISTS idx_bridge_swaps_new ON bridge_swaps(new_call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1710,12 +1744,35 @@ class Store:
             "dismantled_at": r["dismantled_at"],
         }
 
+    def _swap_rows(self, bridge_no: str) -> list[sqlite3.Row]:
+        """这座桥历次换边的留痕行（按换边先后）。只插不改，永不删除。"""
+        return self._conn.execute(
+            "SELECT * FROM bridge_swaps WHERE bridge_no=? ORDER BY swap_seq",
+            (bridge_no,),
+        ).fetchall()
+
+    def _swap_view(self, r: sqlite3.Row) -> dict:
+        return {
+            "swap_seq": r["swap_seq"],
+            "side": r["side"],
+            "old_call_id": r["old_call_id"],
+            "new_call_id": r["new_call_id"],
+            "other_call_id": r["other_call_id"],
+            "swapped_at": r["swapped_at"],
+            # 换边前旧两边的身份与逐对对齐：钉死在换边那一刻，之后的换边、
+            # 拆桥都覆盖不了它
+            "before": json.loads(r["before_json"]),
+        }
+
     def _bridge_view(self, r: sqlite3.Row) -> dict:
         """装一座桥的视图。
 
-        - 活动桥：对齐永远按两边 fragments 现算 —— 新桥段到了，桥继续对上；
+        - 活动桥：对齐永远按两边 fragments 现算 —— 新桥段到了、换了边，桥继续
+          按新两边对上；
         - 已拆桥：取拆桥那一刻钉进 snapshot_json 的快照 —— 两通后来怎么收段
           都碰不到“当时对齐到哪一对”的留痕。
+        换过几次边、每次旧两边是谁、旧对齐什么样，一律从 bridge_swaps 带出，
+        不被现行两边盖掉。
         """
         view = self._row_to_bridge_identity(r)
         if r["status"] == BR_DISMANTLED:
@@ -1725,8 +1782,11 @@ class Store:
                 "left", "right", "pairs", "aligned_count", "gap_count",
                 "total_pairs", "aligned_up_to", "gaps",
             )})
-            return view
-        view.update(self._compute_alignment(r["left_call_id"], r["right_call_id"]))
+        else:
+            view.update(self._compute_alignment(r["left_call_id"], r["right_call_id"]))
+        swaps = self._swap_rows(r["bridge_no"])
+        view["swap_count"] = len(swaps)
+        view["swaps"] = [self._swap_view(s) for s in swaps]
         return view
 
     def create_bridge(
@@ -1813,6 +1873,116 @@ class Store:
             ).fetchone()
             return self._bridge_view(row), "dismantled"
 
+    def swap_bridge_side(
+        self, bridge_no: str, side: str, new_call_id: str
+    ) -> tuple[dict | None, str]:
+        """桥还搭着的时候，把其中一边换成另一通已有片段的电话，返回
+        (桥视图, 结果)。结果为：
+
+        - ``"swapped"``：本次换边成功 —— 桥号不变，桥行的那一列改成新通话，
+          现行对齐立刻按**新的两边**现算；
+        - ``"unknown"``：桥号不存在，桥视图为 None；
+        - ``"dismantled"``：桥已经拆了 —— 已拆掉的桥不能再换边；
+        - ``"unknown_call"``：换上来的不是已知通话；
+        - ``"empty"``：换上来的通话一个片段都没有 —— 空的不能换上来；
+        - ``"already_on_bridge"``：换上来的就是这座桥当前两边中的一通
+          （原地不动 / 自己跟自己搭都不行）；
+        - ``"already_bridged"``：换上来的通话此刻已在另一座活动桥里 ——
+          同一通不能同时待在两座桥里。
+
+        换边只做两件事：先把**旧两边**当时的身份与逐对对齐整体快照，连同
+        “第几次换、换哪边、谁下谁上、另一边是谁”INSERT 进 bridge_swaps
+        （只插不改，之后再换边、再拆桥都盖不掉），再 UPDATE bridges 自己这
+        一行的那一列。fragments / calls / drafts 一个字不写不改：被换下去的
+        那通仍带着自己全部片段、自动恢复自由（bridges 行不再有它，唯一约束
+        随即放行它去搭新桥），只是不再待在这座桥里。BEFORE UPDATE 触发器与
+        两条部分唯一索引在同一事务里兜底并发/绕过应用层的换边冲突。
+        """
+        with self._lock, self._conn:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if r is None:
+                return None, "unknown"
+            if r["status"] == BR_DISMANTLED:
+                return self._bridge_view(r), "dismantled"
+            if side not in (SIDE_LEFT, SIDE_RIGHT):
+                # 正常由入参模型拦在 422；存储层直接被调时也不蒙混
+                return self._bridge_view(r), "bad_side"
+
+            incoming = self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (new_call_id,)
+            ).fetchone()
+            if incoming is None:
+                return self._bridge_view(r), "unknown_call"
+            n = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM fragments WHERE call_id=?", (new_call_id,)
+            ).fetchone()["n"]
+            if n == 0:
+                # 空的不能换上来：一个片段都没有，谈不上按序号对齐
+                return self._bridge_view(r), "empty"
+            if new_call_id in (r["left_call_id"], r["right_call_id"]):
+                # 换上来的不能已经是这座桥上的人：原地不动不叫换边，也不能拿
+                # 桥自己的另一边凑成“自己跟自己”
+                return self._bridge_view(r), "already_on_bridge"
+            if self._active_bridge_row(new_call_id) is not None:
+                # 同一通电话不能同时待在两座桥里；触发器/索引同样兜底
+                return self._bridge_view(r), "already_bridged"
+
+            old_call_id = (
+                r["left_call_id"] if side == SIDE_LEFT else r["right_call_id"]
+            )
+            other_call_id = (
+                r["right_call_id"] if side == SIDE_LEFT else r["left_call_id"]
+            )
+            # 换边前最后算一次旧两边的对齐 —— “旧的两边是谁、对到哪”钉进
+            # bridge_swaps，之后新两边怎么对上都与这份留痕无关
+            before = self._compute_alignment(r["left_call_id"], r["right_call_id"])
+            n_swaps = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM bridge_swaps WHERE bridge_no=?",
+                (bridge_no,),
+            ).fetchone()["n"]
+            now = self._now()
+            # 先留痕、再动桥行：留痕只 INSERT，任何一步失败整笔事务回滚，
+            # 绝不会出现“桥边换了、旧对齐没留下”的半截状态
+            self._conn.execute(
+                "INSERT INTO bridge_swaps(bridge_no, swap_seq, side, old_call_id,"
+                " new_call_id, other_call_id, swapped_at, before_json)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (bridge_no, n_swaps + 1, side, old_call_id, new_call_id,
+                 other_call_id, now, json.dumps(before, ensure_ascii=False)),
+            )
+            col = "left_call_id" if side == SIDE_LEFT else "right_call_id"
+            try:
+                self._conn.execute(
+                    f"UPDATE bridges SET {col}=? WHERE bridge_no=?",
+                    (new_call_id, bridge_no),
+                )
+            except sqlite3.IntegrityError:
+                # 触发器兜底：并发下换上来的通话刚进了别的活动桥
+                return None, "already_bridged"
+            row = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            return self._bridge_view(row), "swapped"
+
+    def get_bridge_swaps(self, bridge_no: str) -> dict | None:
+        """取一座桥的历次换边留痕（按换边先后）。每笔都看得出第几次换、
+        换哪一边、换下/换上/不动的各是谁、何时换，以及换边前旧两边的身份
+        和逐对对齐（before）——不被后来的新两边盖掉。未知桥号返回 None。"""
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = self._swap_rows(bridge_no)
+            return {
+                "bridge_no": bridge_no,
+                "swap_count": len(rows),
+                "swaps": [self._swap_view(x) for x in rows],
+            }
+
     def get_bridge(self, bridge_no: str) -> dict | None:
         """按桥号取一座桥。活动桥对齐现算；已拆桥返回拆桥时的冻结快照。
         未知桥号返回 None。"""
@@ -1834,21 +2004,48 @@ class Store:
     def list_bridges_for_call(self, call_id: str) -> list[dict] | None:
         """某通电话上过的全部桥（搭着的和拆掉的，按搭桥顺序），每座都看得出
         它在左边还是右边。查询本身带着 call_id，两通电话的桥列不串。
-        未知 call_id 返回 None。"""
+        未知 call_id 返回 None。
+
+        “上过”不止桥行当前两边：换边换下去的那通也算上过这座桥（它在桥里
+        待过，换边留痕表带着它的 call_id）。这样的条目 side 给出它**最后一次**
+        在桥上时的左右，currently_on_bridge=false 标明已经被换下去；现行两边
+        的条目 currently_on_bridge=true、side 即当前左右（中途换过边就是
+        换后的那边）。
+        """
         with self._lock:
             if self._conn.execute(
                 "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
             ).fetchone() is None:
                 return None
+            # 桥行当前两边 ∪ 历次换边里出现过的（换下/换上/不动）的桥号
             rows = self._conn.execute(
                 "SELECT * FROM bridges WHERE left_call_id=? OR right_call_id=?"
-                " ORDER BY rowid",
-                (call_id, call_id),
+                " OR bridge_no IN ("
+                "  SELECT bridge_no FROM bridge_swaps"
+                "  WHERE old_call_id=? OR new_call_id=? OR other_call_id=?"
+                ") ORDER BY rowid",
+                (call_id, call_id, call_id, call_id, call_id),
             ).fetchall()
             out = []
             for r in rows:
                 view = self._bridge_view(r)
-                view["side"] = "left" if r["left_call_id"] == call_id else "right"
+                # 沿换边经过回放这通在桥上的位置：进来→（可能换边）→被换下
+                pos = (
+                    SIDE_LEFT if r["left_call_id"] == call_id
+                    else SIDE_RIGHT if r["right_call_id"] == call_id
+                    else None
+                )
+                last_side = pos
+                for s in self._swap_rows(r["bridge_no"]):
+                    if s["new_call_id"] == call_id:
+                        pos = s["side"]
+                        last_side = s["side"]
+                    elif s["old_call_id"] == call_id:
+                        # 换边前它就在 s["side"] 那一边，换完即离桥
+                        last_side = s["side"]
+                        pos = None
+                view["side"] = last_side
+                view["currently_on_bridge"] = pos is not None
                 out.append(view)
             return out
 

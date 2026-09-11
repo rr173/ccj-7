@@ -11,6 +11,7 @@
 """
 
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -38,6 +39,29 @@ class BridgeIn(BaseModel):
     right_call_id: str = Field(
         min_length=1, max_length=256,
         validation_alias=AliasChoices("right_call_id", "right", "call_id_b", "b"),
+    )
+
+
+class BridgeSwapIn(BaseModel):
+    """桥还搭着的时候，把其中一边换成另一通**已经有片段**的电话。
+
+    - side      ：换哪一边（left/right）；
+    - call_id   ：换上来的是哪通电话 —— 必须非空、不能已经待在别的活动桥里，
+                  也不能就是这座桥上当前两边中的任何一通；
+    - 已拆掉的桥不能再换边。桥号不变，换完按新的两边重新对齐；
+      换边当时旧的两边是谁、对到哪，单独留痕，绝不被新的两边盖掉。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    side: Literal["left", "right"] = Field(
+        validation_alias=AliasChoices("side", "replace_side", "which")
+    )
+    call_id: str = Field(
+        min_length=1, max_length=256,
+        validation_alias=AliasChoices(
+            "call_id", "new_call_id", "incoming_call_id", "with"
+        ),
     )
 
 

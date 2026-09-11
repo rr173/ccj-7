@@ -159,6 +159,24 @@
 - **服务再起来，没拆的桥还在、对齐还对得上**：桥行、拆桥快照都落 SQLite
   （WAL + `synchronous=FULL`）。重启后活动桥仍是 `active`，按到过的序号
   重新现算对齐；已拆桥仍是拆时的冻结快照；活动桥唯一约束重启后继续生效。
+- **桥还搭着可以换掉其中一边**：`POST /bridges/{桥号}/swap` 指明换哪一边
+  （`side=left|right`）和换上来的通话。**换完还是这座桥**——桥号不变、状态
+  仍 `active`，现行对齐立刻按**新的两边**重新现算；被换下去的那通**恢复
+  自由**（会话视图 `active_bridge` 清空，可再搭新桥、日后也能再被换回来），
+  它的片段一个不删不改。换上来的那通必须是**已经有片段**的非空通话，且
+  **不能已经待在别的活动桥里**（同一通不能同时待在两座桥里，触发器+唯一
+  索引在换边的 UPDATE 上同样兜底），也不能就是这座桥当前两边中的任何一通；
+  **已经拆掉的桥不能再换边**（409）。换边只往 `bridge_swaps` 表 INSERT 一行、
+  再改桥行那一列，**绝不写不改任何片段**。**换边当时旧的两边是谁、对到哪一
+  对要能事后查到、不被新两边盖掉**：每次换边的留痕（第几次、换哪边、换下/
+  换上/不动各是谁、何时换）都嵌着换边**前**的完整对齐快照 `before`（旧两边
+  身份、逐对单元、`aligned_up_to`、缺口），只插不改——再换边、拆桥都另写
+  别处，这一行一个字不动；`GET /bridges/{桥号}` 带 `swap_count`/`swaps`，
+  `GET /bridges/{桥号}/swaps` 专查历次留痕。换边落 SQLite：**服务再起来，
+  换过边的桥还在，现行对齐按新两边对得上，旧两边的旧对齐仍查得到**；被换
+  下去的那通重启后照样自由。按通话列桥
+  （`GET /sessions/{call_id}/bridges`）把换下去/换上来的经过也列得出：
+  被换下去的条目标 `currently_on_bridge=false`，并给出它最后在桥时的左右侧。
 
 ## API
 
@@ -201,7 +219,9 @@ POST /bridges                            拿两通不同的电话搭一座桥（
 GET  /bridges                            全部桥（搭着的和已拆的，按搭桥顺序）
 GET  /bridges/{bridge_no}                按桥号取桥：两边身份、逐对对齐、缺口缺哪一边（活动桥现算/已拆桥给拆时快照）
 POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立、对齐进度冻结留痕；已拆 409；未知桥号 404）
-GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；未知通话 404）
+POST /bridges/{bridge_no}/swap           换掉活动桥的其中一边（201；已拆 409；空通话/桥上现有两边/已在别的活动桥 409；未知通话 404；未知桥号 404）
+GET  /bridges/{bridge_no}/swaps          这座桥历次换边的留痕（第几次、换哪边、换下/换上/不动各是谁、换边前的旧对齐）
+GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的带 currently_on_bridge=false；未知通话 404）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -277,7 +297,8 @@ GET  /docs                             Swagger UI
 `errata` 表，从不修改 `drafts`。
 
 桥（bridge）关键字段：`bridge_no`（桥号，`B0001` 起全局递增）、
-`left_call_id`/`right_call_id`（左右各是哪通电话，搭定后不可改）、
+`left_call_id`/`right_call_id`（左右各是哪通电话——搭桥后不可直接改，只能
+通过换边把其中一边换掉，桥号不变）、
 `status`（`active` 搭着 / `dismantled` 已拆）、`created_at`/`dismantled_at`、
 `left`/`right`（两边摘要：到了多少段、到过的最大序号、各自的缺口区间）、
 `pairs`（逐对单元：对齐的是
@@ -285,9 +306,12 @@ GET  /docs                             Swagger UI
 `{kind:"gap",missing:"left"|"right"|"both",seq?,gap?,left,right,marker}`，
 缺的一边为 `null`，另一边的字带着但不顶替）、`aligned_count`/`gap_count`/
 `total_pairs`、`aligned_up_to`（连续对齐前缀，"当时对齐到哪一对"）、
-`gaps`（缺口区间列表）。活动桥这些字段按两边片段**现算**；拆桥时把当时的
-全套值冻结进桥行，之后两通再收段也不变。按通话列出时每项还带 `side`
-（该通在这座桥的左边还是右边）。
+`gaps`（缺口区间列表）、`swap_count`/`swaps`（换过几次边及历次留痕：每项含
+`swap_seq`/`side`/`old_call_id`/`new_call_id`/`other_call_id`/`swapped_at`/
+`before`，`before` 是换边**前**旧两边身份与逐对对齐的完整快照，只插不改）。
+活动桥这些对齐字段按当前两边片段**现算**；拆桥时把当时的全套值冻结进桥行，
+之后两通再收段也不变。按通话列出时每项还带 `side`（该通最后在这座桥的左边
+还是右边）与 `currently_on_bridge`（现行两边为 `true`，已被换下去为 `false`）。
 
 ### 示例
 
@@ -595,6 +619,34 @@ curl localhost:8000/sessions/C1/bridges # 这通上过的桥（含左/右侧）
 curl localhost:8000/bridges             # 全部桥（搭着的 + 拆掉的）
 ```
 
+### 桥还搭着时换一边
+
+```bash
+# C1-C2 的桥还搭着，第三通 C3 已有片段；把左边从 C1 换成 C3
+curl -X POST localhost:8000/bridges/B0001/swap -H 'Content-Type: application/json' \
+     -d '{"side":"left","call_id":"C3"}'
+# {"bridge_no":"B0001","status":"active",
+#  "left_call_id":"C3","right_call_id":"C2",   # 还是这座桥，现行两边是新的
+#  "aligned_count":...,"pairs":[...按 C3-C2 重新对齐...],
+#  "swap_count":1,"swaps":[{"swap_seq":1,"side":"left",
+#    "old_call_id":"C1","new_call_id":"C3","other_call_id":"C2",
+#    "swapped_at":"...","before":{...换边前 C1-C2 的完整对齐快照...}}]}
+
+# C1 被换下去，恢复自由：active_bridge 清空，可以立刻再搭别的桥
+curl localhost:8000/sessions/C1          # "active_bridge":null
+
+# 换边当时旧两边是谁、对到哪，单独留痕，再换边、拆桥都盖不掉
+curl localhost:8000/bridges/B0001/swaps
+# {"bridge_no":"B0001","swap_count":1,"swaps":[
+#   {"swap_seq":1,"side":"left","old_call_id":"C1","new_call_id":"C3",
+#    "other_call_id":"C2","swapped_at":"...",
+#    "before":{"left":{"call_id":"C1",...},"right":{"call_id":"C2",...},
+#              "pairs":[...],"aligned_up_to":2,"gaps":[[3,3]]}}]}
+
+# 已拆掉的桥不能再换边（409）；空通话（409）、已在别的活动桥里的通话（409）、
+# 桥上现有的两边（409）都换不上来；未知桥号/通话 404。
+```
+
 ## 运行
 
 ### Docker
@@ -625,7 +677,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           137 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           154 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -651,7 +703,13 @@ tests/           137 个测试：乱序、重传、通话隔离、缺口（含�
                  自动多对上一对、空通话/自己跟自己不能搭、同一通不能同时待在
                  两座桥（含左右交叉，索引+触发器兜底）、拆后可再搭历史全留、
                  拆桥不碰两通片段、拆时对齐快照冻结、按通话列桥不串、重启后
-                 活动桥还在且对齐对得上、拆过的桥仍是拆时快照）
+                 活动桥还在且对齐对得上、拆过的桥仍是拆时快照），
+                 换边（桥号不变按新两边重新对齐、换下的恢复自由且片段不动、
+                 日后可再换回来、空通话/桥上现有两边/已在别的活动桥/已拆的桥
+                 都换不上、换边只插 bridge_swaps 并 UPDATE 桥列不碰片段、
+                 每次换边前旧两边身份与旧对齐快照留痕且不被新两边/拆桥盖掉、
+                 按通话列得出换下去的经过、触发器兜底、重启后现行对齐与历次
+                 留痕都还在）
 Dockerfile / docker-compose.yml
 ```
 

@@ -38,7 +38,9 @@
     GET  /bridges                            全部桥（搭着的和已拆的）
     GET  /bridges/{bridge_no}                按桥号取桥：逐对对齐、缺口缺哪一边（活动桥现算/已拆桥给拆时快照）
     POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立，对齐进度留痕；已拆 409）
-    GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右）
+    POST /bridges/{bridge_no}/swap           桥还搭着时换掉其中一边（桥号不变、按新两边重新对齐；旧两边与旧对齐留痕）
+    GET  /bridges/{bridge_no}/swaps          这座桥历次换边的留痕（换下/换上/不动各是谁、何时换、换边前对齐）
+    GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的也在）
     GET  /healthz                            健康检查
 
     发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回、不能
@@ -51,7 +53,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Response
 
-from .models import BridgeIn, ClaimIn, ErrataIn, FragmentIn, HoldIn
+from .models import BridgeIn, BridgeSwapIn, ClaimIn, ErrataIn, FragmentIn, HoldIn
 from .store import Store
 
 
@@ -63,7 +65,7 @@ def create_app(
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.10.0",
+        version="1.11.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -527,6 +529,46 @@ def create_app(
         if result == "already_dismantled":
             raise HTTPException(status_code=409, detail="bridge already dismantled")
         return bridge
+
+    @app.post("/bridges/{bridge_no}/swap", status_code=201)
+    def swap_bridge_side(bridge_no: str, body: BridgeSwapIn):
+        """桥还搭着时把其中一边换成另一通已经有片段的电话。
+
+        桥号不变，换完按新的两边重新对齐；被换下去的那通恢复自由（可再搭
+        新桥）。换上来的不能是空通话（409）、不能已经在别的活动桥里（409）、
+        也不能就是这座桥当前两边中的一通（409）；已拆掉的桥不能再换边（409）；
+        未知桥号 404、未知通话 404。每次换边旧两边是谁、旧对齐到哪都单独
+        留痕（GET /bridges/{桥号}/swaps），不被新两边盖掉。
+        """
+        bridge, result = store.swap_bridge_side(bridge_no, body.side, body.call_id)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        if result == "dismantled":
+            raise HTTPException(status_code=409, detail="bridge already dismantled")
+        if result == "unknown_call":
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        if result == "empty":
+            raise HTTPException(status_code=409, detail="call has no fragments")
+        if result == "already_on_bridge":
+            raise HTTPException(
+                status_code=409,
+                detail="incoming call is already a side of this bridge",
+            )
+        if result == "already_bridged":
+            raise HTTPException(
+                status_code=409, detail="call already in an active bridge"
+            )
+        return bridge
+
+    @app.get("/bridges/{bridge_no}/swaps")
+    def get_bridge_swaps(bridge_no: str):
+        """这座桥历次换边的留痕（按换边先后）：每次换的是哪一边、谁被换下、
+        谁换上来、另一边是谁、何时换，以及换边前旧两边的逐对对齐快照。
+        没换过边返回空列表；未知桥号 404。"""
+        swaps = store.get_bridge_swaps(bridge_no)
+        if swaps is None:
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        return swaps
 
     @app.get("/sessions/{call_id}/bridges")
     def list_bridges_for_call(call_id: str):
