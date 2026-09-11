@@ -22,6 +22,25 @@ class FragmentIn(BaseModel):
     is_last: bool = False
 
 
+class BridgeIn(BaseModel):
+    """拿两通**不同的**电话搭一座桥，按序号一对一对齐。
+
+    - 必须是两通都已收到片段（非空）的通话；
+    - 同一通电话不能同时待在两座桥里（拆了之后可以再搭）。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    left_call_id: str = Field(
+        min_length=1, max_length=256,
+        validation_alias=AliasChoices("left_call_id", "left", "call_id_a", "a"),
+    )
+    right_call_id: str = Field(
+        min_length=1, max_length=256,
+        validation_alias=AliasChoices("right_call_id", "right", "call_id_b", "b"),
+    )
+
+
 class ClaimIn(BaseModel):
     """认领一稿：认领人标识。稿一旦被人认领，别人不能再认走，
     直到当前认领人把它交出去（release）。"""

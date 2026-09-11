@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十一张表（前十张 + 勘误的 errata）：
+十三张表（前十一张业务表 + holds 压稿表 + bridges 桥表）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -80,6 +80,20 @@
                压稿时与该通话已发各稿的 release_at 对账（含早发晚压的稿），
                不满足单调则拒绝。压稿记录只往本表插行，绝不碰 drafts ——
                压不压、解没解都不改那一稿当时的正文和缺口。
+- bridges    : 桥 —— 两通**不同的**电话按序号一对一对齐。一行一座桥（桥号
+               B0001 全局递增，与通话/稿号空间不相交），记下左右各是哪通
+               电话。同一通电话不能同时待在两座活动桥里：左右各有一条部分
+               唯一索引（WHERE status='active'）兜底，拆桥后该通即可再搭，
+               历史桥行全留。桥只在两通**已收到片段的非空通话**之间搭，空的
+               通话不能拿来搭。桥不写、不改、不删任何 fragments —— 拆掉以后
+               两通还是各自独立的会话，后续片段照常各归各。活动桥的对齐视图
+               永远从两边 fragments 现算：同一个序号两边都到了才算对齐，一边
+               缺了这一对就是缺口（记缺哪一边），绝不拿另一边的字顶替；序号
+               空一大截时两边皆缺的连续号合成一个区间，绝不逐号展开。拆桥
+               （status 置 dismantled、只填 dismantled_at）时把**当时的**两边
+               通话和逐对对齐整体快照进 snapshot_json，此后两通继续收段、继续
+               发稿都碰不到它 —— “当时对齐到哪一对”留得下来。桥行落 SQLite，
+               服务重启后没拆的桥还在，对齐仍按到过的序号对得上。
 """
 
 from __future__ import annotations
@@ -100,6 +114,10 @@ PB_FINISHED = "finished"        # 这一稿快照里的拼装单元已按序听�
 PB_WITHDRAWN = "withdrawn"      # 稿已撤回：进度停在原处，不能再往下听
 PB_NOT_STARTED = "not_started"  # 稿在，但还没拿稿号开始过回放
 PB_HELD = "held"                # 稿还压着：正文看不见，回放不开始也不推进
+
+# 桥状态
+BR_ACTIVE = "active"            # 还搭着：对齐视图按两边 fragments 现算
+BR_DISMANTLED = "dismantled"    # 已拆：对齐停在拆桥那一刻的快照，不再变
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -217,6 +235,48 @@ CREATE TABLE IF NOT EXISTS holds (
     held_at     TEXT NOT NULL       -- 压稿时刻；只新增，永不修改、不提前解
 );
 CREATE INDEX IF NOT EXISTS idx_holds_call ON holds(call_id);
+CREATE TABLE IF NOT EXISTS bridges (
+    bridge_no   TEXT PRIMARY KEY,  -- 桥号：B0001，全局递增，与通话号空间不相交
+    left_call_id  TEXT NOT NULL,   -- 桥左是哪通电话，搭定后永不可改
+    right_call_id TEXT NOT NULL,   -- 桥右是哪通电话，搭定后永不可改
+    status      TEXT NOT NULL,     -- active 搭着 / dismantled 已拆（拆后不再变）
+    created_at  TEXT NOT NULL,     -- 搭桥时刻
+    dismantled_at TEXT,            -- 拆桥时刻；NULL = 还搭着
+    -- 拆桥那一刻的完整对齐快照（含两边通话与逐对进度）。搭着时为 NULL ——
+    -- 活动桥的对齐永远按 fragments 现算，桥随新片段继续对上；拆掉时把当时
+    -- 对齐到哪一对整体钉住，之后两通各自继续，这份留痕一个字不动。
+    snapshot_json TEXT
+);
+-- 同一通电话不能同时待在两座活动桥里：两条部分唯一索引管“同边”冲突，
+-- 触发器再把“一通在左、另一通在右”的交叉情形兜住 —— 任意一通只要已在
+-- 任一活动桥的左或右，再插活动桥一律 ABORT。拆桥（status 变 dismantled）
+-- 后该通即可再搭新桥，历史桥行全留着。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bridges_active_left
+    ON bridges(left_call_id) WHERE status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bridges_active_right
+    ON bridges(right_call_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_bridges_left ON bridges(left_call_id);
+CREATE INDEX IF NOT EXISTS idx_bridges_right ON bridges(right_call_id);
+CREATE TRIGGER IF NOT EXISTS trg_bridges_active_insert
+BEFORE INSERT ON bridges
+WHEN NEW.status='active'
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM bridges WHERE status='active'
+          AND (left_call_id IN (NEW.left_call_id, NEW.right_call_id)
+               OR right_call_id IN (NEW.left_call_id, NEW.right_call_id))
+    ) THEN RAISE(ABORT, 'call already in an active bridge') END;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_bridges_active_update
+BEFORE UPDATE OF status, left_call_id, right_call_id ON bridges
+WHEN NEW.status='active'
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM bridges WHERE status='active' AND bridge_no IS NOT NEW.bridge_no
+          AND (left_call_id IN (NEW.left_call_id, NEW.right_call_id)
+               OR right_call_id IN (NEW.left_call_id, NEW.right_call_id))
+    ) THEN RAISE(ABORT, 'call already in an active bridge') END;
+END;
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1596,6 +1656,204 @@ class Store:
             ).fetchall()
             return [self._erratum_view(r, self._load_draft(r["draft_no"])) for r in rows]
 
+    # ------------------------------------------------------------------ 桥
+
+    def _fragment_map(self, call_id: str) -> dict[int, str]:
+        """一通电话到过的片段（seq -> 原文）。桥对齐只按“到过的序号”对账。"""
+        rows = self._conn.execute(
+            "SELECT seq, text FROM fragments WHERE call_id=?", (call_id,)
+        ).fetchall()
+        return {r["seq"]: r["text"] for r in rows}
+
+    def _active_bridge_row(self, call_id: str) -> sqlite3.Row | None:
+        """这通电话此刻还搭着的桥（左、右两边都查），没有返回 None。
+        同一通电话不能同时待在两座活动桥里。"""
+        return self._conn.execute(
+            "SELECT * FROM bridges WHERE status=? AND (left_call_id=? OR right_call_id=?)",
+            (BR_ACTIVE, call_id, call_id),
+        ).fetchone()
+
+    def _bridge_side(self, call_id: str, fragments: dict[int, str]) -> dict:
+        """桥上一边的最小摘要：身份、到了多少段、到过的最大序号、自身的缺口。"""
+        top = max(fragments, default=0)
+        seqs = set(fragments)
+        return {
+            "call_id": call_id,
+            "fragment_count": len(fragments),
+            "top_seq": top,
+            "gaps": R.missing_ranges(seqs, top) if top else [],
+        }
+
+    def _compute_alignment(self, left_call_id: str, right_call_id: str) -> dict:
+        """按两通电话到过的片段现算对齐视图：逐对单元 + 对齐进度汇总。
+        同一个序号两边都到了才算对齐；一边缺了这一对就是缺口，到的那边的
+        字原样带着但绝不顶替缺的那边。"""
+        left_map = self._fragment_map(left_call_id)
+        right_map = self._fragment_map(right_call_id)
+        pairs = R.build_bridge_pairs(left_map, right_map)
+        summary = R.bridge_alignment_summary(pairs)
+        return {
+            "left": self._bridge_side(left_call_id, left_map),
+            "right": self._bridge_side(right_call_id, right_map),
+            "pairs": pairs,
+            **summary,
+        }
+
+    @staticmethod
+    def _row_to_bridge_identity(r: sqlite3.Row) -> dict:
+        return {
+            "bridge_no": r["bridge_no"],
+            "left_call_id": r["left_call_id"],
+            "right_call_id": r["right_call_id"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+            "dismantled_at": r["dismantled_at"],
+        }
+
+    def _bridge_view(self, r: sqlite3.Row) -> dict:
+        """装一座桥的视图。
+
+        - 活动桥：对齐永远按两边 fragments 现算 —— 新桥段到了，桥继续对上；
+        - 已拆桥：取拆桥那一刻钉进 snapshot_json 的快照 —— 两通后来怎么收段
+          都碰不到“当时对齐到哪一对”的留痕。
+        """
+        view = self._row_to_bridge_identity(r)
+        if r["status"] == BR_DISMANTLED:
+            snap = json.loads(r["snapshot_json"])
+            # 身份字段以表行准（快照是冻结的对齐内容，不另立身份）
+            view.update({k: snap[k] for k in (
+                "left", "right", "pairs", "aligned_count", "gap_count",
+                "total_pairs", "aligned_up_to", "gaps",
+            )})
+            return view
+        view.update(self._compute_alignment(r["left_call_id"], r["right_call_id"]))
+        return view
+
+    def create_bridge(
+        self, left_call_id: str, right_call_id: str
+    ) -> tuple[dict | None, str]:
+        """拿两通不同的电话搭一座桥，返回 (桥视图, 结果)。结果为：
+
+        - ``"created"``：桥搭好了（分配桥号 Bxxxx，全局递增）；
+        - ``"unknown"``：有一边根本不是已知通话（桥视图为 None）；
+        - ``"empty"``：有一边是一通**空**通话（一个片段都没到），不能拿来搭；
+        - ``"same_call"``：两边填了同一通电话 —— 桥要两通不同的电话；
+        - ``"already_bridged"``：其中一通此刻还在另一座（或同一对）活动桥里
+          —— 同一通电话不能同时待在两座桥里；拆了之后才能再搭。
+
+        搭桥只往 bridges 插一行：fragments / calls / drafts 一个字不写不改，
+        两通电话仍是各自独立的会话。
+        """
+        with self._lock, self._conn:
+            sides = []
+            for cid in (left_call_id, right_call_id):
+                call = self._conn.execute(
+                    "SELECT 1 FROM calls WHERE call_id=?", (cid,)
+                ).fetchone()
+                if call is None:
+                    return None, "unknown"
+                sides.append(cid)
+            left_call_id, right_call_id = sides
+            if left_call_id == right_call_id:
+                return None, "same_call"
+            for cid in (left_call_id, right_call_id):
+                n = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM fragments WHERE call_id=?", (cid,)
+                ).fetchone()["n"]
+                if n == 0:
+                    # 空的通话不能拿来搭：一个片段都没有，谈不上按序号对齐
+                    return None, "empty"
+            for cid in (left_call_id, right_call_id):
+                if self._active_bridge_row(cid) is not None:
+                    # 同一通电话不能同时待在两座活动桥里；部分唯一索引同样兜底
+                    return None, "already_bridged"
+            n_bridges = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM bridges"
+            ).fetchone()["n"]
+            bridge_no = f"B{n_bridges + 1:04d}"
+            now = self._now()
+            self._conn.execute(
+                "INSERT INTO bridges(bridge_no, left_call_id, right_call_id,"
+                " status, created_at) VALUES(?,?,?,?,?)",
+                (bridge_no, left_call_id, right_call_id, BR_ACTIVE, now),
+            )
+            return self.get_bridge(bridge_no), "created"
+
+    def dismantle_bridge(self, bridge_no: str) -> tuple[dict | None, str]:
+        """拆掉一座桥，返回 (桥视图, 结果)。结果为：
+
+        - ``"dismantled"``：本次拆掉（把**当时的**两边通话与逐对对齐整体快照
+          钉进 snapshot_json，再置 dismantled）；
+        - ``"already_dismantled"``：已经拆过 —— 原快照原样返回，时间不动；
+        - ``"unknown"``：桥号不存在，视图为 None。
+
+        拆桥只 UPDATE bridges 自己这一行（并写一份快照），不删任何片段：
+        两通电话还是各自独立的会话，继续收段、发稿都不受影响；只是这两通
+        各自恢复自由，可以再跟别的通话搭新桥。
+        """
+        with self._lock, self._conn:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if r is None:
+                return None, "unknown"
+            if r["status"] == BR_DISMANTLED:
+                return self._bridge_view(r), "already_dismantled"
+            # 拆前最后算一次对齐，把“当时对齐到哪一对”整体钉住
+            live = self._compute_alignment(r["left_call_id"], r["right_call_id"])
+            now = self._now()
+            self._conn.execute(
+                "UPDATE bridges SET status=?, dismantled_at=?, snapshot_json=?"
+                " WHERE bridge_no=?",
+                (BR_DISMANTLED, now,
+                 json.dumps(live, ensure_ascii=False), bridge_no),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            return self._bridge_view(row), "dismantled"
+
+    def get_bridge(self, bridge_no: str) -> dict | None:
+        """按桥号取一座桥。活动桥对齐现算；已拆桥返回拆桥时的冻结快照。
+        未知桥号返回 None。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            return None if r is None else self._bridge_view(r)
+
+    def list_bridges(self) -> list[dict]:
+        """全部桥（含已拆的历史桥），按搭桥顺序。活动桥给当前对齐，已拆桥
+        给拆桥时的冻结快照。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM bridges ORDER BY rowid"
+            ).fetchall()
+            return [self._bridge_view(r) for r in rows]
+
+    def list_bridges_for_call(self, call_id: str) -> list[dict] | None:
+        """某通电话上过的全部桥（搭着的和拆掉的，按搭桥顺序），每座都看得出
+        它在左边还是右边。查询本身带着 call_id，两通电话的桥列不串。
+        未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM bridges WHERE left_call_id=? OR right_call_id=?"
+                " ORDER BY rowid",
+                (call_id, call_id),
+            ).fetchall()
+            out = []
+            for r in rows:
+                view = self._bridge_view(r)
+                view["side"] = "left" if r["left_call_id"] == call_id else "right"
+                out.append(view)
+            return out
+
+    # ------------------------------------------------------------------ 稿摘要
+
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对
         该稿是否已有变化（正文/状态/缺口任一不同）。变了就意味着对外给的
@@ -1691,6 +1949,19 @@ class Store:
             # 最近发出的一稿 + 活视图相对它是否已变（该出新稿的信号）；
             # 没发过稿为 None
             view["latest_draft"] = self._latest_draft_info(call_id, view)
+            # 这通电话此刻还搭着的桥（同一通不能同时待在两座活动桥里）；
+            # 已拆的桥不在这里，按桥号/按通话查桥才看历史。桥不改会话本身。
+            active = self._active_bridge_row(call_id)
+            view["active_bridge"] = None if active is None else {
+                "bridge_no": active["bridge_no"],
+                "side": "left" if active["left_call_id"] == call_id else "right",
+                "other_call_id": (
+                    active["right_call_id"]
+                    if active["left_call_id"] == call_id
+                    else active["left_call_id"]
+                ),
+                "created_at": active["created_at"],
+            }
             return view
 
     def list_sessions(self) -> list[dict]:

@@ -134,6 +134,32 @@
   两通电话的压稿不串；**重启后仍按钟点判：没到点的继续看不见，到了点的
   不用再压一次**。
 
+- **两通不同的电话可以搭成一座桥**：`POST /bridges` 拿两通**不同的、非空**
+  的通话搭一座桥（桥号 `B0001` 全局递增，与稿号空间不相交）。桥上按序号
+  `1..N`（N=两边实际到过的最大序号）**一对一对齐**：同一个序号两边都到了
+  才算一对 `aligned`；**一边缺了，这一对就是缺口**（标明缺左还是缺右，到了
+  的那边的字原样带着、缺的那边明确为 `null`）——**绝不拿另一边的字凑上**。
+  两边都没到的连续序号合成一个区间单元，序号空一大截也不逐号展开。对齐
+  进度随时可查：`aligned_count`/`gap_count`/`total_pairs`、缺口区间 `gaps`，
+  以及连续对齐前缀 `aligned_up_to`（第一对就没对上为 0）。**活动桥的对齐
+  永远从两边片段现算**：后来缺的那边补上了，再看同一座桥就多对上一对。
+  桥只新增 `bridges` 表，**不写不改两边的片段**：两通电话始终是各自独立的
+  会话，各自继续收段、发稿互不影响。
+- **同一通电话不能同时待在两座桥里**：搭桥时两边都查活动桥（含左右交叉的
+  情形），数据库还有两条部分唯一索引 + 触发器兜底（`IntegrityError`）。
+  **拆桥**（`POST /bridges/{桥号}/dismantle`）后两通恢复自由，可再搭新桥；
+  空通话、同一通跟自己搭都拒绝（409/404）。
+- **拆掉以后两通还是各自的会话、对齐到哪一对要留得下来**：拆桥只把桥状态
+  置 `dismantled`，并把**那一刻**两边通话与逐对对齐整体快照进桥行
+  （`snapshot_json`），不删任何片段。之后两通继续收段，这座已拆的桥再看
+  永远是拆时那份对齐（`aligned_up_to`、缺口、各对两边的字都钉住）；重复拆
+  409，时间不动。按桥号（`GET /bridges/{桥号}`）、列全部桥
+  （`GET /bridges`）或按通话列（`GET /sessions/{call_id}/bridges`，标明
+  该通在左还是右）都查得到，两通电话的桥列不串。
+- **服务再起来，没拆的桥还在、对齐还对得上**：桥行、拆桥快照都落 SQLite
+  （WAL + `synchronous=FULL`）。重启后活动桥仍是 `active`，按到过的序号
+  重新现算对齐；已拆桥仍是拆时的冻结快照；活动桥唯一约束重启后继续生效。
+
 ## API
 
 ```
@@ -171,6 +197,11 @@ GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按
 POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409；未知稿号 404）
 GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
 GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
+POST /bridges                            拿两通不同的电话搭一座桥（201；空通话/同一通/已在活动桥 409；未知通话 404）
+GET  /bridges                            全部桥（搭着的和已拆的，按搭桥顺序）
+GET  /bridges/{bridge_no}                按桥号取桥：两边身份、逐对对齐、缺口缺哪一边（活动桥现算/已拆桥给拆时快照）
+POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立、对齐进度冻结留痕；已拆 409；未知桥号 404）
+GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；未知通话 404）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -179,7 +210,9 @@ GET  /docs                             Swagger UI
 `gaps`（当前缺口区间列表，如 `[[2,4]]`）、`was_incomplete`、`gap_history`
 （每项含 `range`/`detected_at`/`filled_at`）、`version`、
 `retransmissions`、`conflicts`、`completed_at`、`latest_draft`
-（最近一稿的 `draft_no`/`issued_at`/`changed_since`，未发过稿为 `null`）。
+（最近一稿的 `draft_no`/`issued_at`/`changed_since`，未发过稿为 `null`）、
+`active_bridge`（这通电话此刻还搭着的桥：`bridge_no`/`side`(left|right)/
+`other_call_id`/`created_at`，没搭桥或已拆为 `null`）。
 
 稿（draft）关键字段：`draft_no`（稿号）、`draft_seq`（该通话第几稿）、
 `status`/`content`/`gaps`（发稿那一刻的状态、正文、缺口）、`gap_history`
@@ -242,6 +275,19 @@ GET  /docs                             Swagger UI
 `draft`（当时那一稿的完整快照——勘误改不了它的正文和缺口）。没人认领不能
 出；同一段不能出两次；缺口和越界序号不是段；撤过的稿不能出。勘误只写
 `errata` 表，从不修改 `drafts`。
+
+桥（bridge）关键字段：`bridge_no`（桥号，`B0001` 起全局递增）、
+`left_call_id`/`right_call_id`（左右各是哪通电话，搭定后不可改）、
+`status`（`active` 搭着 / `dismantled` 已拆）、`created_at`/`dismantled_at`、
+`left`/`right`（两边摘要：到了多少段、到过的最大序号、各自的缺口区间）、
+`pairs`（逐对单元：对齐的是
+`{kind:"aligned",seq,left:{seq,text},right:{seq,text}}`；缺口是
+`{kind:"gap",missing:"left"|"right"|"both",seq?,gap?,left,right,marker}`，
+缺的一边为 `null`，另一边的字带着但不顶替）、`aligned_count`/`gap_count`/
+`total_pairs`、`aligned_up_to`（连续对齐前缀，"当时对齐到哪一对"）、
+`gaps`（缺口区间列表）。活动桥这些字段按两边片段**现算**；拆桥时把当时的
+全套值冻结进桥行，之后两通再收段也不变。按通话列出时每项还带 `side`
+（该通在这座桥的左边还是右边）。
 
 ### 示例
 
@@ -502,6 +548,53 @@ curl localhost:8000/drafts/C1-D0001
 # 另一通电话各压各的，互不约束；重启后仍按钟点判，没到点继续看不见。
 ```
 
+### 两通电话搭一座桥
+
+```bash
+# 两通电话各收到一些片段（C1 缺第 3 段，C2 四段齐）
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C1","seq":1,"text":"你好"}'
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C1","seq":2,"text":"听得到吗"}'
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C1","seq":4,"text":"先这样"}'
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C2","seq":1,"text":"喂"}'
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C2","seq":2,"text":"听得到"}'
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C2","seq":3,"text":"我这边信号差"}'
+
+# 搭成一座桥：逐对给，第 3 对只到右边 → 缺口“缺左”，右边的字不拿来顶左边
+curl -X POST localhost:8000/bridges -H 'Content-Type: application/json' \
+     -d '{"left_call_id":"C1","right_call_id":"C2"}'
+# {"bridge_no":"B0001","status":"active","aligned_count":3,"gap_count":1,
+#  "total_pairs":4,"aligned_up_to":2,"gaps":[[3,3]],
+#  "pairs":[{"kind":"aligned","seq":1,"left":{"seq":1,"text":"你好"},
+#            "right":{"seq":1,"text":"喂"}}, ...,
+#           {"kind":"gap","missing":"left","seq":3,"left":null,
+#            "right":{"seq":3,"text":"我这边信号差"},
+#            "marker":"[桥缺口:第3对 缺左]"}, ...]}
+
+# 同一通不能同时待在两座桥里（409）；空通话、自己跟自己搭也不行
+curl -X POST localhost:8000/bridges -H 'Content-Type: application/json' \
+     -d '{"left_call_id":"C1","right_call_id":"C3"}'      # 409 / 404
+
+# 缺的那边补上：活动桥再看，同一座桥自动多对上一对（aligned_up_to=4）
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"C1","seq":3,"text":"等一下"}'
+curl localhost:8000/bridges/B0001
+# {"aligned_count":4,"gap_count":0,"aligned_up_to":4,"gaps":[]}
+
+# 拆桥：两通恢复各自独立（片段一个不删），桥当时对齐到哪一对冻结留痕
+curl -X POST localhost:8000/bridges/B0001/dismantle
+# {"bridge_no":"B0001","status":"dismantled","aligned_count":4,
+#  "dismantled_at":"...", "pairs":[...拆那一刻的样子...]}
+curl localhost:8000/bridges/B0001       # 以后永远是拆时那份快照
+curl localhost:8000/sessions/C1/bridges # 这通上过的桥（含左/右侧）
+curl localhost:8000/bridges             # 全部桥（搭着的 + 拆掉的）
+```
+
 ## 运行
 
 ### Docker
@@ -532,7 +625,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           114 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           137 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -553,7 +646,12 @@ tests/           114 个测试：乱序、重传、通话隔离、缺口（含�
                  重启后勘误还在），定时压稿（没到点只见“还压着、何时解”、
                  正文缺口全遮、到点无需操作自动可见、解禁不早于发稿、写定不改
                  不提前解、一稿只能压一次、后发稿不更早解、压着时回放/投递/
-                 勘误都被拦住且各视图不泄正文、两通电话不串、重启后按钟点判）
+                 勘误都被拦住且各视图不泄正文、两通电话不串、重启后按钟点判），
+                 桥（逐对对齐、一边缺了就是缺口不拿另一边凑、缺段补上活动桥
+                 自动多对上一对、空通话/自己跟自己不能搭、同一通不能同时待在
+                 两座桥（含左右交叉，索引+触发器兜底）、拆后可再搭历史全留、
+                 拆桥不碰两通片段、拆时对齐快照冻结、按通话列桥不串、重启后
+                 活动桥还在且对齐对得上、拆过的桥仍是拆时快照）
 Dockerfile / docker-compose.yml
 ```
 

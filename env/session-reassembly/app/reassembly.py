@@ -158,3 +158,129 @@ def status_of(seqs: set[int], last_seq: int | None, had_gap: bool = False) -> st
     if last_seq is not None or had_gap:
         return COMPLETE
     return ASSEMBLING
+
+
+# 桥（两通不同电话按序号一对一对齐）
+
+BR_ALIGNED = "aligned"  # 这一对两边都到了：对齐
+BR_GAP = "gap"          # 这一对至少一边没到：缺口，另一边的字绝不顶替
+
+# 缺口里是哪一边没到
+BR_MISSING_LEFT = "left"
+BR_MISSING_RIGHT = "right"
+BR_MISSING_BOTH = "both"
+
+
+def bridge_gap_marker(missing: str, lo: int, hi: int) -> str:
+    """桥上缺口的对外可见标记。只到一边的缺口逐对给；两边都没到的整段
+    （哪一边都没有字可贴）可以合成一行，不按序号逐个展开。"""
+    if lo == hi:
+        n = str(lo)
+    else:
+        n = f"{lo}-{hi}"
+    if missing == BR_MISSING_LEFT:
+        return f"[桥缺口:第{n}对 缺左]"
+    if missing == BR_MISSING_RIGHT:
+        return f"[桥缺口:第{n}对 缺右]"
+    return f"[桥缺口:第{n}对 两边皆缺]"
+
+
+def build_bridge_pairs(
+    left: dict[int, str], right: dict[int, str]
+) -> list[dict]:
+    """两通电话按序号 1..N（N=两边实际到过的最大序号）一对一对齐。
+
+    对齐规则：
+    - 同一个序号两边都到了，才是一对“对齐”（aligned），两边的字各自带着，
+      绝不互相顶替；
+    - 一边到了、一边没到：这一对是缺口（gap），记哪一边缺 —— 到的那边的字
+      原样贴在这一对上（看得出桥为什么断），但不拿它冒充另一边；
+    - 两边都没到的连续序号：合成一个“两边皆缺”的区间单元，不逐号展开，
+      序号空一大截也只有几个单元。
+
+    遍历的是**到过的序号**而非 1..N 逐个序号，N 即便到十亿、中间整段没到，
+    输出也只有“到了的对 + 少量缺口区间”。
+    """
+    top = max([*left.keys(), *right.keys()], default=0)
+    pairs: list[dict] = []
+    cursor = 1
+    for n in sorted(set(left) | set(right)):
+        if n > top:
+            break
+        if n < 1:
+            continue
+        if cursor < n:
+            # cursor..n-1：两边都没到（否则这段里就会有更早的序号终止区间）
+            pairs.append({
+                "kind": BR_GAP,
+                "missing": BR_MISSING_BOTH,
+                "gap": [cursor, n - 1],
+                "marker": bridge_gap_marker(BR_MISSING_BOTH, cursor, n - 1),
+            })
+        if n in left and n in right:
+            pairs.append({
+                "kind": BR_ALIGNED,
+                "seq": n,
+                "left": {"seq": n, "text": left[n]},
+                "right": {"seq": n, "text": right[n]},
+            })
+        elif n in left:
+            pairs.append({
+                "kind": BR_GAP,
+                "missing": BR_MISSING_RIGHT,
+                "seq": n,
+                "left": {"seq": n, "text": left[n]},
+                "right": None,
+                "marker": bridge_gap_marker(BR_MISSING_RIGHT, n, n),
+            })
+        else:
+            pairs.append({
+                "kind": BR_GAP,
+                "missing": BR_MISSING_LEFT,
+                "seq": n,
+                "left": None,
+                "right": {"seq": n, "text": right[n]},
+                "marker": bridge_gap_marker(BR_MISSING_LEFT, n, n),
+            })
+        cursor = n + 1
+    if cursor <= top:
+        # 末尾两边都没到的区间（按“到过的最大序号”对账时本不该出现——最大
+        # 序号至少一边到了；保留这层兜底使函数对任意输入自洽）
+        pairs.append({
+            "kind": BR_GAP,
+            "missing": BR_MISSING_BOTH,
+            "gap": [cursor, top],
+            "marker": bridge_gap_marker(BR_MISSING_BOTH, cursor, top),
+        })
+    return pairs
+
+
+def bridge_alignment_summary(pairs: list[dict]) -> dict:
+    """由 build_bridge_pairs 的单元汇总对齐进度：
+
+    - aligned_count / total_pairs：对齐了多少对、一共对到第几对（对齐进度）；
+    - gap_count：当前缺口对数（两边皆缺的区间按区间跨度计对数，不逐号展开）；
+    - aligned_up_to：对齐前缀对齐到第几对（从 1 起连续无缺口的最大序号，
+      0=第一对就没对上）——“桥当时对齐到哪一对”的留痕；
+    - gaps：每个缺口区间 [lo, hi]（单边缺口是 [n, n]）。
+    """
+    aligned = {p["seq"] for p in pairs if p["kind"] == BR_ALIGNED}
+    gap_units = [p for p in pairs if p["kind"] == BR_GAP]
+    gap_ranges = [
+        [p["seq"], p["seq"]] if "seq" in p else list(p["gap"]) for p in gap_units
+    ]
+    total = max(aligned | {hi for _, hi in gap_ranges}, default=0)
+    gap_count = total - len(aligned)
+    aligned_up_to = 0
+    for n in sorted(aligned):
+        if n == aligned_up_to + 1:
+            aligned_up_to = n
+        else:
+            break
+    return {
+        "aligned_count": len(aligned),
+        "gap_count": gap_count,
+        "total_pairs": total,
+        "aligned_up_to": aligned_up_to,
+        "gaps": gap_ranges,
+    }

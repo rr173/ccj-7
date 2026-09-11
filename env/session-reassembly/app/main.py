@@ -34,6 +34,11 @@
     POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409）
     GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
     GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
+    POST /bridges                            拿两通不同的电话搭一座桥（201；空通话/同一通/已在活动桥 409；未知 404）
+    GET  /bridges                            全部桥（搭着的和已拆的）
+    GET  /bridges/{bridge_no}                按桥号取桥：逐对对齐、缺口缺哪一边（活动桥现算/已拆桥给拆时快照）
+    POST /bridges/{bridge_no}/dismantle      拆桥（两通恢复各自独立，对齐进度留痕；已拆 409）
+    GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右）
     GET  /healthz                            健康检查
 
     发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回、不能
@@ -46,7 +51,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Response
 
-from .models import ClaimIn, ErrataIn, FragmentIn, HoldIn
+from .models import BridgeIn, ClaimIn, ErrataIn, FragmentIn, HoldIn
 from .store import Store
 
 
@@ -58,7 +63,7 @@ def create_app(
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.9.0",
+        version="1.10.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -470,6 +475,67 @@ def create_app(
         if late is None:
             raise HTTPException(status_code=404, detail="unknown draft_no")
         return {"draft_no": draft_no, "late_fragments": late}
+
+    # -------------------------------------------------------------- 桥
+
+    @app.post("/bridges", status_code=201)
+    def create_bridge(body: BridgeIn):
+        """拿两通不同的电话搭一座桥，桥上按序号一对一对齐。
+
+        同一序号两边都到了才算一对对齐；一边缺了这一对就是缺口（标明缺哪
+        一边），绝不拿另一边的字顶替。同一通电话不能同时待在两座桥里；空的
+        通话不能拿来搭。201 搭好；未知通话 404；空通话/同一通/已在活动桥里
+        409。
+        """
+        bridge, result = store.create_bridge(body.left_call_id, body.right_call_id)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        if result == "empty":
+            raise HTTPException(status_code=409, detail="call has no fragments")
+        if result == "same_call":
+            raise HTTPException(status_code=409, detail="a bridge needs two different calls")
+        if result == "already_bridged":
+            raise HTTPException(status_code=409, detail="call already in an active bridge")
+        return bridge
+
+    @app.get("/bridges")
+    def list_bridges():
+        """全部桥（搭着的和已拆的，按搭桥顺序）。活动桥对齐现算；已拆桥给
+        拆桥那一刻的对齐快照。"""
+        return {"bridges": store.list_bridges()}
+
+    @app.get("/bridges/{bridge_no}")
+    def get_bridge(bridge_no: str):
+        """按桥号取一座桥：两边各是哪通、逐对对齐到哪、缺口缺哪一边。
+        活动桥永远反映最新片段；已拆桥停在拆时快照。未知桥号 404。"""
+        bridge = store.get_bridge(bridge_no)
+        if bridge is None:
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        return bridge
+
+    @app.post("/bridges/{bridge_no}/dismantle", status_code=201)
+    @app.post(
+        "/bridges/{bridge_no}/teardown", status_code=201, include_in_schema=False
+    )
+    def dismantle_bridge(bridge_no: str):
+        """拆桥：两通电话恢复成各自独立的会话（片段一个不删、不改），同时把
+        这座桥当时对齐到哪一对整体留痕。拆过的桥返回 409（原快照不动）；
+        未知桥号 404。"""
+        bridge, result = store.dismantle_bridge(bridge_no)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        if result == "already_dismantled":
+            raise HTTPException(status_code=409, detail="bridge already dismantled")
+        return bridge
+
+    @app.get("/sessions/{call_id}/bridges")
+    def list_bridges_for_call(call_id: str):
+        """这通电话上过的全部桥（搭着的和拆掉的，按搭桥顺序），每座都看得出
+        它在左边还是右边。查询带 call_id，两通电话的桥列不串。未知通话 404。"""
+        bridges = store.list_bridges_for_call(call_id)
+        if bridges is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"call_id": call_id, "bridges": bridges}
 
     @app.get("/healthz")
     def healthz():
