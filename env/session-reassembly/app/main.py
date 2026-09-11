@@ -23,9 +23,15 @@
     POST /drafts/{draft_no}/claim/release    把当前认领交出去，之后才能换人认（未认领 409）
     GET  /drafts/{draft_no}/claim            这一稿现在谁认着（含历次认领/交出记录）
     GET  /sessions/{call_id}/claims          该通话全部稿的认领状态（按发稿顺序）
+    POST /drafts/{draft_no}/delivery         按稿号往下游投（待回音/已收下 409；退了才能再投）
+    POST /drafts/{draft_no}/delivery/accept  下游收下（200；终态，不能再收/退/投）
+    POST /drafts/{draft_no}/delivery/return  下游退回（200；退了之后才能再投）
+    GET  /drafts/{draft_no}/delivery         这一稿投到哪了（历次投递 + 当前状态）
+    GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按发稿顺序）
     GET  /healthz                            健康检查
 
-    发出去的稿要先有人认领：没认领的稿不能签收、不能回放、也不能撤回（409）。
+    发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回，也不能
+    往下游投递（409）。
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.6.0",
+        version="1.7.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -147,6 +153,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="draft not claimed")
         if result == "already_signed":
             raise HTTPException(status_code=409, detail="draft already signed")
+        if result == "delivery_pending":
+            raise HTTPException(status_code=409, detail="delivery awaiting response")
+        if result == "delivery_accepted":
+            raise HTTPException(status_code=409, detail="delivery already accepted")
         if result == "already_withdrawn":
             raise HTTPException(status_code=409, detail="draft already withdrawn")
         return withdrawal
@@ -268,6 +278,72 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if claims is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"claims": claims}
+
+    # -------------------------------------------------------------- 下游投递
+
+    @app.post("/drafts/{draft_no}/delivery", status_code=201)
+    def deliver_draft(draft_no: str):
+        """按稿号把一稿往下游投，返回投递记录（带稿号、通话、第几稿、第几次投，
+        看得出投的是哪一稿）。没人认领不能投；上一次投出去还没回音不能再投；
+        下游已经收下不能再投；稿撤过也不能投。只有退回之后才能再投一次
+        （attempt 递增，历次投递都留着）。201 本次投出；上述冲突 409；
+        未知稿号 404。"""
+        delivery, result = store.deliver_draft(draft_no)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        if result == "withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
+        if result == "pending":
+            raise HTTPException(status_code=409, detail="delivery awaiting response")
+        if result == "accepted":
+            raise HTTPException(status_code=409, detail="delivery already accepted")
+        return delivery
+
+    @app.post("/drafts/{draft_no}/delivery/accept")
+    def accept_delivery(draft_no: str):
+        """下游收下最近一次待回音的投递。收下是终态：不能再退、不能再投。
+        200；没在等回音（没投过/已答复过）、稿已撤回或未认领 → 409；
+        未知稿号 → 404。"""
+        return _decide_delivery(draft_no, accepted=True)
+
+    @app.post("/drafts/{draft_no}/delivery/return")
+    def return_delivery(draft_no: str):
+        """下游退回最近一次待回音的投递。退回之后这稿才能再投一次；
+        退回本身不改那一稿当时的正文和缺口。
+        200；没在等回音、稿已撤回或未认领 → 409；未知稿号 → 404。"""
+        return _decide_delivery(draft_no, accepted=False)
+
+    def _decide_delivery(draft_no: str, accepted: bool):
+        delivery, result = store.decide_draft(draft_no, accepted)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        if result == "withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
+        if result == "not_pending":
+            raise HTTPException(status_code=409, detail="no delivery awaiting response")
+        return delivery
+
+    @app.get("/drafts/{draft_no}/delivery")
+    def get_delivery(draft_no: str):
+        """这一稿投到哪了：当前状态（none/pending/accepted/returned）和历次
+        投递（投出时间、收下/退回时间）。记录嵌的仍是发稿当时的正文和缺口。"""
+        delivery = store.get_delivery(draft_no)
+        if delivery is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return delivery
+
+    @app.get("/sessions/{call_id}/deliveries")
+    def list_deliveries(call_id: str):
+        """该通话全部稿的投递状态（按发稿顺序）。查询带 call_id，
+        结构上列不出另一通电话的投递。"""
+        deliveries = store.list_deliveries(call_id)
+        if deliveries is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"deliveries": deliveries}
 
     # -------------------------------------------------------------- 迟到片段
 

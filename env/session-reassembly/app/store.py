@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-九张表：
+十张表（前九张 + 下游投递的 deliveries）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -51,6 +51,14 @@
                交出只往本表插行或填 released_at，绝不碰 drafts —— 认领改
                不了那一稿当时的正文和缺口。稿号自带 call_id，拿一通的号认
                不到另一通的稿；记录落 SQLite，重启后认了谁还在。
+- deliveries : 下游投递记录 —— 发出去的稿按**稿号**往下游投，投一次一行，
+               每行记下这是该稿第几次投、何时投、下游是收下还是退回
+               （accepted_at / returned_at 都为 NULL 即待回音）。没人认领
+               不能投；上一次投出去还没回音（待回音）不能再投；退回之后才能
+               再投（新起一行，attempt 递增）；收下是终态，不能退也不能再投。
+               投递只往本表插行、只填自己的回音时间：drafts 里那一稿当时的
+               正文、parts、缺口一个字不改。稿号自带 call_id，拿一通的号投
+               不到另一通的稿；记录落 SQLite，重启后投到哪了还在。
 """
 
 from __future__ import annotations
@@ -155,6 +163,18 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS idx_claims_draft ON claims(draft_no);
 CREATE INDEX IF NOT EXISTS idx_claims_call ON claims(call_id);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 投递顺序（一稿多次投递可排）
+    draft_no    TEXT NOT NULL REFERENCES drafts(draft_no),  -- 按稿号投，投的是哪一稿
+    call_id     TEXT NOT NULL,      -- 随稿号所属通话，按通话查/隔离都带着它
+    attempt     INTEGER NOT NULL,   -- 这一稿第几次投（退回后再投 +1）
+    delivered_at TEXT NOT NULL,     -- 投出去的时刻
+    accepted_at TEXT,               -- NULL = 没收下；下游收下的时刻（终态）
+    returned_at TEXT,               -- NULL = 没退回；下游退回的时刻（之后才能再投）
+    UNIQUE (draft_no, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_draft ON deliveries(draft_no);
+CREATE INDEX IF NOT EXISTS idx_deliveries_call ON deliveries(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -560,6 +580,14 @@ class Store:
             ).fetchone()
             if signed is not None:
                 return self.get_withdrawal(draft_no), "already_signed"
+
+            # 下游投递与签收同构：投出去被收下是终态（不能撤）；投出去还没
+            # 回音也不能撤 —— 不能在下游等着答复时把稿抽走。退回之后再撤不拦。
+            latest = self._latest_delivery_row(draft_no)
+            if latest is not None and latest["accepted_at"] is not None:
+                return self.get_withdrawal(draft_no), "delivery_accepted"
+            if latest is not None and latest["returned_at"] is None:
+                return self.get_withdrawal(draft_no), "delivery_pending"
 
             if not self._is_claimed(draft_no):
                 # 没认领不能撤：稿和待签都原样不动，等有人认领后再撤
@@ -1031,6 +1059,164 @@ class Store:
             # 当时那一稿的完整快照 —— 认领动作改不了它的正文和缺口
             "draft": draft,
         }
+
+    # ------------------------------------------------------------------ 下游投递
+
+    DEL_PENDING = "pending"    # 投出去了，下游还没给回音
+    DEL_ACCEPTED = "accepted"  # 下游收下 —— 终态：不能退、不能再投
+    DEL_RETURNED = "returned"  # 下游退回 —— 退了之后才能再投
+    DEL_NONE = "none"          # 还没往下游投过
+
+    def _latest_delivery_row(self, draft_no: str) -> sqlite3.Row | None:
+        """这一稿最近一次投递（attempt 最大的那行），没投过返回 None。"""
+        return self._conn.execute(
+            "SELECT * FROM deliveries WHERE draft_no=?"
+            " ORDER BY attempt DESC LIMIT 1",
+            (draft_no,),
+        ).fetchone()
+
+    @staticmethod
+    def _delivery_status(row: sqlite3.Row | None) -> str:
+        if row is None:
+            return Store.DEL_NONE
+        if row["accepted_at"] is not None:
+            return Store.DEL_ACCEPTED
+        if row["returned_at"] is not None:
+            return Store.DEL_RETURNED
+        return Store.DEL_PENDING
+
+    def deliver_draft(self, draft_no: str) -> tuple[dict | None, str]:
+        """按稿号把一稿投给下游，返回 (投递视图, 结果)。结果为：
+
+        - ``"delivered"``：本次投出去（新起一次投递，attempt+1）；
+        - ``"pending"``：上一次投出去还没回音 —— 不能再投一次；
+        - ``"accepted"``：下游已经收下 —— 收下后不能再投；
+        - ``"withdrawn"``：稿已撤回 —— 撤过的稿不能投；
+        - ``"not_claimed"``：还没人认领 —— 没人认领的不能投；
+        - ``"unknown"``：稿号不存在，视图为 None。
+
+        投递只往 deliveries 插一行：drafts 里那一稿当时的正文、parts、缺口
+        一个字不改。稿号自带 call_id、一稿一号，拿一通的号投不到另一通的稿。
+        """
+        with self._lock, self._conn:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None, "unknown"
+            if not self._is_claimed(draft_no):
+                # 没人认领的不能投：不产生投递记录，等有人认领后再投
+                return self.get_delivery(draft_no), "not_claimed"
+            if draft["is_withdrawn"]:
+                return self.get_delivery(draft_no), "withdrawn"
+            latest = self._latest_delivery_row(draft_no)
+            status = self._delivery_status(latest)
+            if status == self.DEL_PENDING:
+                # 投出去还没回音之前不能再投：返回还欠着回音的那一次
+                return self.get_delivery(draft_no), "pending"
+            if status == self.DEL_ACCEPTED:
+                return self.get_delivery(draft_no), "accepted"
+            attempt = 1 if latest is None else latest["attempt"] + 1
+            now = _now()
+            self._conn.execute(
+                "INSERT INTO deliveries(draft_no, call_id, attempt, delivered_at)"
+                " VALUES(?,?,?,?)",
+                (draft_no, draft["call_id"], attempt, now),
+            )
+            return self.get_delivery(draft_no), "delivered"
+
+    def decide_draft(self, draft_no: str, accepted: bool) -> tuple[dict | None, str]:
+        """下游对最近一次待回音的投递给答复：收下或退回。结果为：
+
+        - ``"accepted"``/``"returned"``：本次答复写进了那次投递；
+        - ``"not_pending"``：最近一次投递已经有回音，或从没投过 —— 收下后
+          不能再退，退回后也不能再退，没投过无从答复；
+        - ``"withdrawn"``：稿已撤回 —— 撤过的稿不再收下游答复；
+        - ``"not_claimed"``：还没人认领 —— 没认领的稿没有下游在办；
+        - ``"unknown"``：稿号不存在，视图为 None。
+
+        答复只 UPDATE deliveries 自己那行的回音时间（带“仍是待回音”条件，
+        影响 0 行即已被答复过），绝不碰 drafts —— 投递和答复都改不了那一稿
+        当时的正文和缺口。
+        """
+        with self._lock, self._conn:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None, "unknown"
+            if not self._is_claimed(draft_no):
+                return self.get_delivery(draft_no), "not_claimed"
+            if draft["is_withdrawn"]:
+                return self.get_delivery(draft_no), "withdrawn"
+            latest = self._latest_delivery_row(draft_no)
+            if latest is None or latest["accepted_at"] is not None \
+                    or latest["returned_at"] is not None:
+                return self.get_delivery(draft_no), "not_pending"
+            now = _now()
+            col = "accepted_at" if accepted else "returned_at"
+            cur = self._conn.execute(
+                f"UPDATE deliveries SET {col}=?"
+                " WHERE id=? AND accepted_at IS NULL AND returned_at IS NULL",
+                (now, latest["id"]),
+            )
+            if cur.rowcount == 0:
+                return self.get_delivery(draft_no), "not_pending"
+            return self.get_delivery(draft_no), (
+                self.DEL_ACCEPTED if accepted else self.DEL_RETURNED
+            )
+
+    def _delivery_view(self, draft: dict) -> dict:
+        """一稿的投递总览：当前状态 + 历次投递（按 attempt 排序）。
+
+        每次投递都带稿号、通话、第几稿、第几次投、投出/收下/退回时间，投完
+        看得出投的是哪一稿；draft 嵌的是 drafts 表那份 INSERT-only 快照，
+        投递、退回、再投、收下都改不了它的正文和缺口。"""
+        rows = self._conn.execute(
+            "SELECT attempt, delivered_at, accepted_at, returned_at"
+            " FROM deliveries WHERE draft_no=? ORDER BY attempt",
+            (draft["draft_no"],),
+        ).fetchall()
+        attempts = [
+            {
+                "attempt": r["attempt"],
+                "delivered_at": r["delivered_at"],
+                "accepted_at": r["accepted_at"],
+                "returned_at": r["returned_at"],
+                "status": self._delivery_status(r),
+            }
+            for r in rows
+        ]
+        latest = attempts[-1] if attempts else None
+        return {
+            "draft_no": draft["draft_no"],
+            "call_id": draft["call_id"],
+            "draft_seq": draft["draft_seq"],
+            # 当前投到哪了：没投过 none / 待回音 pending / 已收下 accepted /
+            # 已退回 returned（退了之后才能再投）
+            "status": self._delivery_status(self._latest_delivery_row(draft["draft_no"])),
+            "attempt_count": len(attempts),
+            "current_attempt": None if latest is None else latest["attempt"],
+            "attempts": attempts,
+            "delivered_at": None if latest is None else latest["delivered_at"],
+            "accepted_at": None if latest is None else latest["accepted_at"],
+            "returned_at": None if latest is None else latest["returned_at"],
+            # 发稿当时的完整快照 —— 投递流转改不了它的正文和缺口
+            "draft": draft,
+        }
+
+    def get_delivery(self, draft_no: str) -> dict | None:
+        """按稿号取投递总览（从未投过 status=none）。未知稿号返回 None。"""
+        with self._lock:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None
+            return self._delivery_view(draft)
+
+    def list_deliveries(self, call_id: str) -> list[dict] | None:
+        """某通电话全部稿的投递状态（按发稿顺序）。查询本身带着 call_id，
+        结构上列不出另一通电话的投递。未知 call_id 返回 None。"""
+        with self._lock:
+            drafts = self.list_drafts(call_id)
+            if drafts is None:
+                return None
+            return [self._delivery_view(d) for d in drafts]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对

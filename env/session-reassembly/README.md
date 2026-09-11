@@ -79,13 +79,24 @@
   不能再开。稿号自带 `call_id`，全局稿号操作也撤不到另一通电话；撤回记录
   落 SQLite，重启后仍是终态。
 - **发出去的稿要先有人认领**：`POST /drafts/{draft_no}/claim` 按稿号认领，
-  没认领的稿不能签收、不能回放、也不能撤回（一律 409）。一稿同一时刻
+  没认领的稿不能签收、不能回放、不能撤回，**也不能往下游投**（一律 409）。一稿同一时刻
   至多一个人持有：一个人认了，别人再认是 409，认不走；本人重复认领幂等
   （200，时间不动）。当前认领人 `POST .../claim/release` 把稿交出去之后，
-  别人才能认领；交出后、还没人认期间同样不能签/听/撤。认领只往 `claims`
+  别人才能认领；交出后、还没人认期间同样不能签/听/撤/投。认领只往 `claims`
   表写记录，绝不碰 `drafts`——那一稿当时的正文和缺口一个字不变；每次
   认领/交出都在 `history` 里留痕。稿号自带 `call_id`，拿一通的号认不到
   另一通的稿；认领记录落 SQLite，重启后认了谁还在。
+- **发出去的稿要能往下游投**：`POST /drafts/{draft_no}/delivery` 按稿号投，
+  投一次在 `deliveries` 表落一行（第几次投、何时投），投完看得出投的是哪一稿
+  （记录带稿号、通话、第几稿，并嵌发稿当时的稿快照）。**没人认领的不能投**；
+  **投出去还没回音之前不能再投一次**（409）。下游可以
+  `POST .../delivery/accept` **收下**，也可以 `POST .../delivery/return`
+  **退回**：**退了之后才能再投**（新起一行、attempt 递增，历次投递都留痕）；
+  **收下之后不能再退也不能再投**（终态，重复答复 409，首次时间不动）。投递、
+  退回、再投、收下只写 `deliveries` 表，**绝不改那一稿当时的正文和缺口**
+  （`drafts` 仍是 INSERT-only）。稿号自带 `call_id`，两通电话的投递不串，
+  拿一通的号投不走另一通的稿；投递记录落 SQLite，**重启后投到哪了还在**。
+  稿撤过不能投；投出去待回音、或已被下游收下的稿也不能撤回（退回后不拦）。
 - **稿发出后才到的段单独记迟到**：某通电话发出至少一稿后，新入库的片段
   （内容相同的重传不算——它没带来新东西）会单独记进迟到记录，挂上到达
   时最新的一稿，看得出补在哪一稿后面；接收响应里 `ingest.late=true`
@@ -121,6 +132,11 @@ POST /drafts/{draft_no}/claim            按稿号认领（201；本人重复认
 POST /drafts/{draft_no}/claim/release    把当前认领交出去，之后才能换人认（200；未认领 409）
 GET  /drafts/{draft_no}/claim            这一稿现在谁认着（含历次认领/交出记录）
 GET  /sessions/{call_id}/claims          该通话全部稿的认领状态（按发稿顺序）
+POST /drafts/{draft_no}/delivery         按稿号往下游投（201；待回音/已收下/已撤回/未认领 409；未知稿号 404）
+POST /drafts/{draft_no}/delivery/accept  下游收下（200；终态，不能再退/再投；没在等回音 409）
+POST /drafts/{draft_no}/delivery/return  下游退回（200；退了之后才能再投；没在等回音 409）
+GET  /drafts/{draft_no}/delivery         这一稿投到哪了（当前状态 + 历次投递，未投过 status=none）
+GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按发稿顺序）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -169,9 +185,18 @@ GET  /docs                             Swagger UI
 `status`（`claimed` 有人持有 / `unclaimed` 没人认）、`claimed_by`/`claimed_at`
 （当前谁认着、何时认的，未认领为 `null`）、`history`（历次认领/交出记录：
 谁认的、何时认、何时交出去，永不删除）、`draft`（当时那一稿的完整快照——
-认领、交出、换人认都改不了它的正文和缺口）。没认领的稿签收、回放、撤回
-一律 409；认领记录只往 `claims` 表写，从不修改 `drafts`、`receipts`、
+认领、交出、换人认都改不了它的正文和缺口）。没认领的稿签收、回放、撤回、
+投递一律 409；认领记录只往 `claims` 表写，从不修改 `drafts`、`receipts`、
 `playbacks`。
+
+下游投递（delivery）关键字段：`draft_no`/`call_id`/`draft_seq`（投的是哪稿）、
+`status`（`none` 还没投过 / `pending` 投出去待回音 / `accepted` 下游已收下 /
+`returned` 下游已退回）、`current_attempt`/`attempt_count`（当前是第几次投、
+共投过几次）、`attempts`（历次投递：`attempt`/`delivered_at`/`accepted_at`/
+`returned_at`/`status`，退回后再投另起一行，永不删除）、`delivered_at`/
+`accepted_at`/`returned_at`（最近一次投递的三个时刻）、`draft`（发稿当时的
+完整快照——投递流转改不了它的正文和缺口）。没人认领不能投；待回音期间不能
+再投；退了才能再投；收下是终态。投递只写 `deliveries` 表，从不修改 `drafts`。
 
 ### 示例
 
@@ -347,6 +372,38 @@ curl localhost:8000/drafts/C1-D0001/claim
 curl localhost:8000/sessions/C1/claims
 ```
 
+### 往下游投
+
+```bash
+# 没人认领的稿不能投（409）；先认领
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
+
+# 按稿号投：投完看得出投的是哪一稿（稿号、通话、第几稿、第几次投都在）
+curl -X POST localhost:8000/drafts/C1-D0001/delivery
+# {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,"status":"pending",
+#  "current_attempt":1,"attempt_count":1,"attempts":[{"attempt":1,...}],
+#  "draft":{...发稿当时那稿...}}
+
+# 投出去还没回音，不能再投一次
+curl -X POST localhost:8000/drafts/C1-D0001/delivery          # 409
+
+# 下游可以退回；退了之后才能再投（新起一次，attempt=2，历次投递都留着）
+curl -X POST localhost:8000/drafts/C1-D0001/delivery/return
+curl -X POST localhost:8000/drafts/C1-D0001/delivery          # 201，attempt=2
+
+# 下游也可以收下；收下之后不能再退、也不能再投
+curl -X POST localhost:8000/drafts/C1-D0001/delivery/accept
+curl -X POST localhost:8000/drafts/C1-D0001/delivery/return   # 409
+curl -X POST localhost:8000/drafts/C1-D0001/delivery          # 409
+
+# 投到哪了（重启后仍是这个状态）；投、退、再投、收都不改稿当时的正文和缺口
+curl localhost:8000/drafts/C1-D0001/delivery
+# {"status":"accepted","attempts":[{"attempt":1,"status":"returned",...},
+#                                  {"attempt":2,"status":"accepted",...}],...}
+curl localhost:8000/sessions/C1/deliveries                    # 该通话全部稿的投递状态
+```
+
 ## 运行
 
 ### Docker
@@ -377,7 +434,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           78 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           89 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -387,9 +444,12 @@ tests/           78 个测试：乱序、重传、通话隔离、缺口（含越
                  正在听停在原处、两通电话不串、重启后仍是撤回态），
                  迟到片段（单独记录、看得出补在哪一稿后面、不改稿不动待签
                  不让回放突然听完、两通电话不串、重启后记录还在），
-                 以及认领（没认领不能签/听/撤、认了别人认不走、本人重复认领
+                 以及认领（没认领不能签/听/撤/投、认了别人认不走、本人重复认领
                  幂等、交出去才能换人认、认领不改稿、两通电话不串、
-                 重启后认了谁还在）
+                 重启后认了谁还在），下游投递（按稿号投、看得出投的是哪稿、
+                 没认领不能投、没回音不能再投、收下终态不能再退再投、退了才能
+                 再投且历次留痕、投递不改正文缺口、两通电话不串、重启后投到哪
+                 了还在、与撤回互斥）
 Dockerfile / docker-compose.yml
 ```
 
