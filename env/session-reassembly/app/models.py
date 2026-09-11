@@ -10,7 +10,9 @@
 保留先到者并计入 conflicts。
 """
 
-from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class FragmentIn(BaseModel):
@@ -31,3 +33,32 @@ class ErrataIn(BaseModel):
     勘误只新增记录，那一稿当时的正文和缺口一个字不动。"""
     seq: int = Field(ge=1)
     new_text: str = Field(max_length=65536)
+
+
+class HoldIn(BaseModel):
+    """把一稿压到指定时刻才解：写明几点几分能见。
+
+    解禁时刻不能早于这稿发出的时刻；写上去就不能改、也不能提前解开；
+    同一通电话里后发出的稿，解禁时刻不能早于先发的稿。没到点之前只能
+    知道这稿还压着、何时解，正文和缺口一律看不见。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    release_at: datetime = Field(
+        ...,
+        validation_alias=AliasChoices(
+            "release_at", "unlock_at", "embargo_until", "release_time"
+        ),
+    )
+
+    @field_validator("release_at", mode="before")
+    @classmethod
+    def _naive_as_utc(cls, v):
+        # 不带时区的时刻一律按 UTC 解释，绝不当地方式时间蒙混
+        if isinstance(v, str):
+            dt = datetime.fromisoformat(v)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+        return v

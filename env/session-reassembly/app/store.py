@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十一张表（前十张 + 勘误的 errata），另有两稿对照的 comparisons 共十二张：
+十一张表（前十张 + 勘误的 errata）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -68,17 +68,18 @@
                drafts —— 那一稿当时的正文和缺口一个字不改。稿号自带
                call_id，拿一通的号给另一通出不了勘误；记录落 SQLite，
                重启后出过的勘误还在。
-- comparisons: 两稿对照单 —— 发出去的两份稿要能对着看。每次出单钉住是哪两
-               稿（draft_no_a/b，按请求里的先后分 a、b）、同一通电话
-               （call_id）、以及**只含对不上的段**的对照结果（mismatches），
-               每条记下段序号/区间、a 当时是什么、b 当时是什么（文本段 /
-               该稿当时的缺口 / 这稿还没到这段 absent）。对账只读两份
-               drafts 快照、沿区间边界推进，绝不 UPDATE drafts —— 对照改
-               不了那两稿当时的正文和缺口；一致的段（两边同文、或两边都缺）
-               不进单。UNIQUE(lo_draft_no, hi_draft_no) 按稿号排序后的无序
-               对去重：同一对稿不能对两次（409，原单时间不动）；稿号自带
-               call_id，不是同一通电话的两稿不进对照（409）。记录落 SQLite，
-               重启后对照过的还在。
+- holds      : 压稿记录 —— 有的稿得压着，写明几点几分才能见。一稿至多一条
+               （draft_no 主键：一稿只能压一次），记下解禁时刻 release_at
+               （不能早于发稿时刻）。这条记录只 INSERT 不 UPDATE：写上去就
+               不能改，也没有任何“提前解开”的动作 —— 解不解只由读取当时的
+               时刻与 release_at 比对得出（now >= release_at 即已解），重启
+               后同样按钟点判，到点的稿绝不需要“再压一次/再解一次”。没到点
+               时所有取稿视图只给“还压着、何时解”（present_draft 把正文、
+               parts、缺口等快照字段全抹成 null），到点后再取自然就是当时
+               钉住的正文和缺口。同一通电话里后发的稿不能比先发的更早解：
+               压稿时与该通话已发各稿的 release_at 对账（含早发晚压的稿），
+               不满足单调则拒绝。压稿记录只往本表插行，绝不碰 drafts ——
+               压不压、解没解都不改那一稿当时的正文和缺口。
 """
 
 from __future__ import annotations
@@ -87,6 +88,7 @@ import json
 import os
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from . import reassembly as R
@@ -97,6 +99,7 @@ PB_BLOCKED = "blocked"          # 下一个单元是发稿当时的缺口，停�
 PB_FINISHED = "finished"        # 这一稿快照里的拼装单元已按序听完
 PB_WITHDRAWN = "withdrawn"      # 稿已撤回：进度停在原处，不能再往下听
 PB_NOT_STARTED = "not_started"  # 稿在，但还没拿稿号开始过回放
+PB_HELD = "held"                # 稿还压着：正文看不见，回放不开始也不推进
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS fragments (
@@ -207,21 +210,13 @@ CREATE TABLE IF NOT EXISTS errata (
 );
 CREATE INDEX IF NOT EXISTS idx_errata_draft ON errata(draft_no);
 CREATE INDEX IF NOT EXISTS idx_errata_call ON errata(call_id);
-CREATE TABLE IF NOT EXISTS comparisons (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- 出单顺序
-    call_id        TEXT NOT NULL,      -- 两稿必须同属一通电话（随稿号校验）
-    draft_no_a     TEXT NOT NULL REFERENCES drafts(draft_no),  -- 请求里的第一稿
-    draft_no_b     TEXT NOT NULL REFERENCES drafts(draft_no),  -- 请求里的第二稿
-    draft_seq_a    INTEGER NOT NULL,   -- 第一稿是该通话第几稿
-    draft_seq_b    INTEGER NOT NULL,   -- 第二稿是该通话第几稿
-    lo_draft_no    TEXT NOT NULL,      -- 两稿号排序后较小者：无序对去重键
-    hi_draft_no    TEXT NOT NULL,      -- 两稿号排序后较大者
-    mismatches_json TEXT NOT NULL,     -- 只含对不上的段（a/b 各自当时是什么）
-    mismatch_count INTEGER NOT NULL,   -- 对不上的段数（可能为 0：两份一致）
-    compared_at    TEXT NOT NULL,      -- 出单时刻
-    UNIQUE (lo_draft_no, hi_draft_no)  -- 同一对稿不能对两次
+CREATE TABLE IF NOT EXISTS holds (
+    draft_no    TEXT PRIMARY KEY REFERENCES drafts(draft_no),  -- 一稿至多压一次
+    call_id     TEXT NOT NULL,      -- 随稿号所属通话，按通话隔离/单调对账都带着它
+    release_at  TEXT NOT NULL,      -- 解禁时刻（UTC ISO-8601），不能早于发稿时刻
+    held_at     TEXT NOT NULL       -- 压稿时刻；只新增，永不修改、不提前解
 );
-CREATE INDEX IF NOT EXISTS idx_comparisons_call ON comparisons(call_id);
+CREATE INDEX IF NOT EXISTS idx_holds_call ON holds(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -233,13 +228,12 @@ LEGACY_GAP_EVENTS_DDL = (
 )
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 class Store:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, now_fn: Callable[[], datetime] | None = None):
         self.db_path = db_path
+        # 解禁判定必须按“现在钟点”来：可注入时钟便于把时间拨到解禁前后
+        # 验证“到点自动可见、没到点仍看不见”；默认就是真实 UTC 时钟。
+        self._now_dt_fn = now_fn or (lambda: datetime.now(timezone.utc))
         parent = os.path.dirname(os.path.abspath(db_path))
         os.makedirs(parent, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -250,6 +244,14 @@ class Store:
         self._conn.executescript(SCHEMA)
         self._backfill_receipts()
         self._lock = threading.RLock()
+
+    def now_dt(self) -> datetime:
+        """当前时刻（带时区，UTC 可比）。压稿是否已解只由它和 release_at 判。"""
+        dt = self._now_dt_fn()
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    def _now(self) -> str:
+        return self.now_dt().isoformat()
 
     def close(self) -> None:
         self._conn.close()
@@ -303,7 +305,7 @@ class Store:
 
     def ingest(self, call_id: str, seq: int, text: str, is_last: bool = False) -> dict:
         """接收一个片段（可乱序、可重传），返回本次接收结果。"""
-        now = _now()
+        now = self._now()
         with self._lock, self._conn:  # 单事务，要么全落盘要么不落
             duplicate = False
             conflict = False
@@ -497,7 +499,7 @@ class Store:
             ).fetchone()
             seq = 1 if prev is None else prev["draft_seq"] + 1
             draft_no = f"{call_id}-D{seq:04d}"
-            now = _now()
+            now = self._now()
             self._conn.execute(
                 "INSERT INTO drafts(draft_no, call_id, draft_seq, status, content,"
                 " parts_json, gaps_json, gap_history_json, was_incomplete,"
@@ -546,6 +548,12 @@ class Store:
             # 撤回状态在读取时叠加；下面两个默认值由 get_draft/list_drafts 补全
             "is_withdrawn": False,
             "withdrawn_at": None,
+            # 压稿状态同样在读取时叠加（holds 表 + 当前钟点）；默认没压过
+            "is_held": False,          # 此刻是否仍压着（压过且已到点 → false）
+            "released": True,          # 没压过视为随时可见；压着未到点 → false
+            "release_at": None,        # 解禁时刻；没压过为 null
+            "held_at": None,           # 压稿时刻；没压过为 null
+            "visibility": "visible",   # held = 还压着，正文/缺口不可见
         }
 
     def _withdrawn_at(self, draft_no: str) -> str | None:
@@ -554,32 +562,94 @@ class Store:
         ).fetchone()
         return None if r is None else r["withdrawn_at"]
 
+    def _hold_row(self, draft_no: str) -> sqlite3.Row | None:
+        """这一稿的压稿记录（一稿至多一条），没压过返回 None。"""
+        return self._conn.execute(
+            "SELECT * FROM holds WHERE draft_no=?", (draft_no,)
+        ).fetchone()
+
+    @staticmethod
+    def _parse_ts(value: str) -> datetime:
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    def _is_held(self, draft_no: str) -> bool:
+        """这一稿此刻是否仍压着（压过、但还没到解禁时刻）。"""
+        h = self._hold_row(draft_no)
+        return h is not None and self.now_dt() < self._parse_ts(h["release_at"])
+
+    # 压着期间对外一律抹掉的快照字段：正文、拼装单元、缺口、缺口历史、状态等，
+    # 调用方只能拿到“还压着、何时解”，不能从任何字段反推出正文或缺口。
+    _REDACTED_KEYS = (
+        "status", "content", "parts", "gaps", "gap_history", "was_incomplete",
+        "fragment_count", "version", "supersedes", "predecessor_had_gaps",
+        "predecessor_gaps",
+    )
+
+    def present_draft(self, draft: dict | None) -> dict | None:
+        """对外呈现一稿：还压着时只留身份信息和压稿状态，正文/缺口一律 null；
+        没压着（含已到点自动解禁、从没压过）则原样返回当时那份快照。幂等：
+        传入已经遮罩过的稿不会再处理。"""
+        if draft is None or not draft.get("is_held"):
+            return draft
+        if draft.get("content") is None and draft.get("visibility") == "held":
+            return draft  # 已经遮罩过
+        view = dict(draft)
+        for key in self._REDACTED_KEYS:
+            view[key] = None
+        view["visibility"] = "held"
+        return view
+
     def _with_draft_lifecycle(self, draft: dict) -> dict:
         draft["withdrawn_at"] = self._withdrawn_at(draft["draft_no"])
         draft["is_withdrawn"] = draft["withdrawn_at"] is not None
+        h = self._hold_row(draft["draft_no"])
+        if h is None:
+            # 默认值在 _row_to_draft 里已放好（没压过：可见）
+            return draft
+        released = self.now_dt() >= self._parse_ts(h["release_at"])
+        draft["release_at"] = h["release_at"]
+        draft["held_at"] = h["held_at"]
+        # 到点即解：不写任何“解禁”动作，只按当前钟点判定 —— 重启后同理，
+        # 到点的稿不用再压一次、也不用任何操作，再拿就是当时的正文和缺口
+        draft["released"] = released
+        draft["is_held"] = not released
+        draft["visibility"] = "visible" if released else "held"
         return draft
+
+    def _load_draft(self, draft_no: str) -> dict | None:
+        """按稿号取完整快照（含撤回/压稿标记），**不做压稿遮罩**。
+        仅供内部逻辑（回放要读 parts、勘误要读原文）使用；对外呈现一律走
+        get_draft → present_draft。"""
+        r = self._conn.execute(
+            "SELECT * FROM drafts WHERE draft_no=?", (draft_no,)
+        ).fetchone()
+        return None if r is None else self._with_draft_lifecycle(self._row_to_draft(r))
 
     def get_draft(self, draft_no: str) -> dict | None:
         """按稿号取已发稿。正文来自 drafts 快照；撤回标记来自 withdrawals。
-        后来的补段、重传、新稿都不会改变这里返回的正文和缺口。"""
+        后来的补段、重传、新稿都不会改变这里返回的正文和缺口。
+        稿还压着（没到解禁时刻）时只回“还压着、何时解”：正文、拼装单元、
+        缺口等快照字段全为 null；到点后同一调用自动给回当时那份完整快照。"""
         with self._lock:
-            r = self._conn.execute(
-                "SELECT * FROM drafts WHERE draft_no=?", (draft_no,)
-            ).fetchone()
-            return None if r is None else self._with_draft_lifecycle(self._row_to_draft(r))
+            return self.present_draft(self._load_draft(draft_no))
 
     def get_draft_by_seq(self, call_id: str, draft_seq: int) -> dict | None:
         """按“通话 + 第几稿”取稿：查询本身就带着 call_id，结构上不可能
-        拿到另一通电话的稿。"""
+        拿到另一通电话的稿。压着时同样只给压稿状态、不给正文和缺口。"""
         with self._lock:
             r = self._conn.execute(
                 "SELECT * FROM drafts WHERE call_id=? AND draft_seq=?",
                 (call_id, draft_seq),
             ).fetchone()
-            return None if r is None else self._with_draft_lifecycle(self._row_to_draft(r))
+            if r is None:
+                return None
+            return self.present_draft(self._with_draft_lifecycle(self._row_to_draft(r)))
 
     def list_drafts(self, call_id: str) -> list[dict] | None:
-        """某通电话已发出的全部稿（按发稿顺序）。未知 call_id 返回 None。"""
+        """某通电话已发出的全部稿（按发稿顺序）。未知 call_id 返回 None。
+        还压着的稿在列表里同样只露压稿状态 —— 列得出有这稿、何时解，
+        但正文和缺口看不见；到点后列表里自动是完整样子。"""
         with self._lock:
             if self._conn.execute(
                 "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
@@ -589,7 +659,114 @@ class Store:
                 "SELECT * FROM drafts WHERE call_id=? ORDER BY draft_seq",
                 (call_id,),
             ).fetchall()
-            return [self._with_draft_lifecycle(self._row_to_draft(r)) for r in rows]
+            return [
+                self.present_draft(self._with_draft_lifecycle(self._row_to_draft(r)))
+                for r in rows
+            ]
+
+    # ------------------------------------------------------------------ 压稿
+
+    HELD = "held"                # 压着，没到解禁时刻：正文/缺口不可见
+    RELEASE_IN_PAST = "release_in_past"        # 解禁时刻早于发稿时刻
+    ALREADY_HELD = "already_held"              # 一稿只能压一次
+    ORDER_VIOLATION = "order_violation"        # 后发的稿不能比先发的更早解
+
+    def hold_draft(self, draft_no: str, release_at: datetime) -> tuple[dict | None, str]:
+        """把一稿压到指定时刻才见，返回 (压稿后呈现的稿, 结果)。结果为：
+
+        - ``"held"``：压上了，release_at 就此钉死，不改、不提前解；
+        - ``"already_held"``：这稿压过了 —— 一稿只能压一次（哪怕已到点）；
+        - ``"release_in_past"``：解禁时刻早于这稿发出的时刻，不允许；
+        - ``"order_violation"``：同一通电话里它比先发的稿更早解，不允许；
+        - ``"unknown"``：稿号不存在，稿为 None。
+
+        只往 holds 插一行，绝不 UPDATE/DELETE：解禁时刻写上去就不能改，也
+        没有“提前解开”的入口 —— 解不解只由读取时的钟点决定。压稿不动
+        drafts，那一稿当时的正文和缺口照样原样躺在快照里，只是没到点不呈现。
+        """
+        release_at = (
+            release_at if release_at.tzinfo is not None
+            else release_at.replace(tzinfo=timezone.utc)
+        )
+        with self._lock, self._conn:
+            r = self._conn.execute(
+                "SELECT call_id, draft_seq, issued_at FROM drafts WHERE draft_no=?",
+                (draft_no,),
+            ).fetchone()
+            if r is None:
+                return None, "unknown"
+            if self._hold_row(draft_no) is not None:
+                # 一稿只能压一次：已压（含已到点自动解禁）也不许重压/改时刻
+                return self.get_draft(draft_no), self.ALREADY_HELD
+            issued = self._parse_ts(r["issued_at"])
+            if release_at < issued:
+                # 解禁时刻不能早于这稿发出的时刻 —— 没发出来谈不上压
+                return self.get_draft(draft_no), self.RELEASE_IN_PAST
+
+            # 同一通电话里，后发出的稿不能比先发出的稿更早解：与这通电话
+            # 每一稿的解禁时刻对账（含先发、但此刻才压的稿），按 draft_seq
+            # 分两边比；不按压稿先后比 —— 规矩认的是发稿顺序。
+            others = self._conn.execute(
+                "SELECT h.release_at AS release_at, d.draft_seq AS draft_seq"
+                " FROM holds h JOIN drafts d ON d.draft_no = h.draft_no"
+                " WHERE d.call_id=?",
+                (r["call_id"],),
+            ).fetchall()
+            for o in others:
+                other_at = self._parse_ts(o["release_at"])
+                if (o["draft_seq"] < r["draft_seq"] and release_at < other_at) or \
+                   (o["draft_seq"] > r["draft_seq"] and other_at < release_at):
+                    return self.get_draft(draft_no), self.ORDER_VIOLATION
+
+            now_text = self._now()
+            self._conn.execute(
+                "INSERT INTO holds(draft_no, call_id, release_at, held_at)"
+                " VALUES(?,?,?,?)",
+                (draft_no, r["call_id"], release_at.isoformat(), now_text),
+            )
+            return self.get_draft(draft_no), self.HELD
+
+    def get_hold(self, draft_no: str) -> dict | None:
+        """按稿号取压稿信息。压着时只能知道“还压着、何时解”——正文和缺口
+        不给；已到点的再拿，draft 就是当时那份完整快照。没压过返回 None。"""
+        with self._lock:
+            h = self._hold_row(draft_no)
+            if h is None:
+                return None
+            draft = self._load_draft(draft_no)
+            return self._hold_view(h, draft)
+
+    def list_holds(self, call_id: str) -> list[dict] | None:
+        """某通电话压过的全部稿（按发稿顺序）。查询带 call_id，两通电话的
+        压稿记录不串。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT h.* FROM holds h JOIN drafts d ON d.draft_no = h.draft_no"
+                " WHERE h.call_id=? ORDER BY d.draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._hold_view(x, self._load_draft(x["draft_no"])) for x in rows]
+
+    def _hold_view(self, h: sqlite3.Row, draft: dict) -> dict:
+        """压稿信息视图：身份信息、解禁时刻与当前压/解状态始终可见；嵌的
+        draft 走 present_draft —— 压着时正文和缺口全为 null，到点才是快照。"""
+        held = self.now_dt() < self._parse_ts(h["release_at"])
+        return {
+            "draft_no": h["draft_no"],
+            "call_id": h["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "held_at": h["held_at"],
+            "release_at": h["release_at"],
+            "released": not held,
+            "is_held": held,
+            "visibility": self.HELD if held else "visible",
+            # 压着时只有“还压着、何时解”；到点后这里才是当时的正文和缺口
+            "draft": self.present_draft(draft),
+        }
 
     # ------------------------------------------------------------------ 撤回
 
@@ -640,7 +817,7 @@ class Store:
                 # 没认领不能撤：稿和待签都原样不动，等有人认领后再撤
                 return None, "not_claimed"
 
-            now = _now()
+            now = self._now()
             self._conn.execute(
                 "INSERT INTO withdrawals(draft_no, call_id, withdrawn_at)"
                 " VALUES(?,?,?)",
@@ -717,14 +894,13 @@ class Store:
             cur = self._conn.execute(
                 "UPDATE receipts SET signed_at=?"
                 " WHERE draft_no=? AND signed_at IS NULL",
-                (_now(), draft_no),
+                (self._now(), draft_no),
             )
             return self.get_receipt(draft_no), (
                 "signed" if cur.rowcount > 0 else "already_signed"
             )
 
-    @staticmethod
-    def _receipt_view(r: sqlite3.Row, draft: dict) -> dict:
+    def _receipt_view(self, r: sqlite3.Row, draft: dict) -> dict:
         return {
             "draft_no": draft["draft_no"],
             "call_id": draft["call_id"],
@@ -732,14 +908,20 @@ class Store:
             "signed_at": r["signed_at"],
             "withdrawn_at": draft["withdrawn_at"],
             "is_withdrawn": draft["is_withdrawn"],
-            # 签收与撤回互斥：已签不可撤，撤过不可签；待签且未撤才是 pending
+            "release_at": draft["release_at"],
+            "is_held": draft["is_held"],
+            # 签收与撤回互斥：已签不可撤，撤过不可签；没到点是 held；
+            # 待签且未撤、已到点（或没压过）才是 pending
             "status": "signed" if r["signed_at"] else (
-                "withdrawn" if draft["is_withdrawn"] else "pending"
+                "withdrawn" if draft["is_withdrawn"] else (
+                    "held" if draft["is_held"] else "pending"
+                )
             ),
             "issued_at": draft["issued_at"],
             # 当时那一稿的完整快照：正文、缺口……发出即冻结。待签期间后来
-            # 补段、重传、会话变新都碰不到它；签完也看得出签的是哪一稿
-            "draft": draft,
+            # 补段、重传、会话变新都碰不到它；签完也看得出签的是哪一稿。
+            # 稿还压着时经 present_draft 遮罩 —— 正文和缺口看不见。
+            "draft": self.present_draft(draft),
         }
 
     def get_receipt(self, draft_no: str) -> dict | None:
@@ -777,20 +959,25 @@ class Store:
         - ``"started"``：本次新开始（position=0）；
         - ``"existing"``：已开始过 —— 只回到当前进度，绝不重头再听；
         - ``"withdrawn"``：稿已撤回 —— 不插行、不重开（即使此前没开始过）；
+        - ``"held"``：稿还压着 —— 正文看不见，不能开始；到点自动解禁后才行；
         - ``"not_claimed"``：还没人认领 —— 没认领的稿不能听；
         - ``"unknown"``：稿号不存在，视图为 None。
         """
         with self._lock, self._conn:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None, "unknown"
             if draft["is_withdrawn"]:
                 # 撤回是终态：即使此前没开始过，也不允许撤后再开一条回放
                 return self.get_playback(draft_no), "withdrawn"
+            if draft["is_held"]:
+                # 还压着：正文和缺口都看不见，更不能听 —— 不产生任何进度。
+                # 没有任何“提前解”的入口，到点后同一调用自动放行。
+                return self.get_playback(draft_no), "held"
             if not self._is_claimed(draft_no):
                 # 没认领不能听：不产生任何进度，等有人认领后再开始
                 return self.get_playback(draft_no), "not_claimed"
-            now = _now()
+            now = self._now()
             cur = self._conn.execute(
                 "INSERT INTO playbacks(draft_no, call_id, position, started_at, updated_at)"
                 " VALUES(?,?,0,?,?)"
@@ -808,6 +995,8 @@ class Store:
         - 下一个单元是**发稿当时的缺口**：停住 —— 不前进、不跳过，状态
           blocked，position 原封不动，updated_at 也不动；
         - 稿已撤回：停在听到的位置，状态 withdrawn，不前进、不写完成时间；
+        - 稿仍压着：状态 held，next/heard 为空，位置不动 —— 压着时正文
+          不可见，已经听到的位置也不再外泄下一段；到点后再推自然继续；
         - 已到快照末尾：finished，重复推进无效；
         - 还没开始 / 稿号未知：None（由 API 区分 409 / 404）。
         单元列表取自 drafts 表那份永不修改的快照，所以“后来补上的段”
@@ -819,9 +1008,15 @@ class Store:
             ).fetchone()
             if pb is None:
                 return None
-            draft = self.get_draft(draft_no)  # 只读快照；本方法不写 drafts
+            draft = self._load_draft(draft_no)  # 只读快照；本方法不写 drafts
             if draft["is_withdrawn"]:
                 # 撤回到达即停：保留 position，不再推进、不跳过、不写 finished_at
+                return self._playback_view(
+                    self._get_playback_row(draft_no), draft, None
+                )
+            if draft["is_held"]:
+                # 压着（先听过、后被压）：停在听到的位置，next/heard 为空，
+                # 不前进、不跳过；到点自动解禁后同一调用才接着往下
                 return self._playback_view(
                     self._get_playback_row(draft_no), draft, None
                 )
@@ -831,7 +1026,7 @@ class Store:
             if pos < len(parts) and "text" in parts[pos]:
                 pos += 1
                 heard = parts[pos - 1]
-                now = _now()
+                now = self._now()
                 if pos >= len(parts):
                     self._conn.execute(
                         "UPDATE playbacks SET position=?, updated_at=?,"
@@ -847,9 +1042,13 @@ class Store:
             return self._playback_view(self._get_playback_row(draft_no), draft, heard)
 
     @staticmethod
-    def _playback_state(parts: list[dict], position: int, withdrawn: bool = False) -> str:
+    def _playback_state(
+        parts: list[dict], position: int, withdrawn: bool = False, held: bool = False
+    ) -> str:
         if withdrawn:
             return PB_WITHDRAWN
+        if held:
+            return PB_HELD
         if position >= len(parts):
             return PB_FINISHED
         return PB_BLOCKED if "gap" in parts[position] else PB_PLAYING
@@ -861,15 +1060,18 @@ class Store:
 
         稿号未知返回 None；稿在但还没开始（playbacks 无行）由调用方决定如何
         表达 —— 本方法只服务已经开始的回放。视图里嵌整份稿快照，是同一份
-        只读数据的呈现，回放推进不改它一个字。
+        只读数据的呈现，回放推进不改它一个字。稿还压着时状态为 held，
+        next 为空、嵌的 draft 也经 present_draft 遮罩，正文和缺口不外泄。
         """
         if pb is None:
             return None
         if draft is None:
-            draft = self.get_draft(pb["draft_no"])
+            draft = self._load_draft(pb["draft_no"])
         parts = draft["parts"]
         pos = pb["position"]
-        state = self._playback_state(parts, pos, draft["is_withdrawn"])
+        state = self._playback_state(
+            parts, pos, draft["is_withdrawn"], draft["is_held"]
+        )
         view = {
             "draft_no": draft["draft_no"],
             "call_id": draft["call_id"],
@@ -882,10 +1084,11 @@ class Store:
             "finished_at": pb["finished_at"],
             "next": None,                 # 下一个要听的单元；末尾为 null
             "heard": heard,               # 本次推进刚听到的片段（仅推进响应）
-            "draft": draft,               # 发稿那一刻的快照，永不被回放改动
+            # 发稿那一刻的快照，永不被回放改动；压着时由 present_draft 遮罩
+            "draft": self.present_draft(draft),
         }
-        if state == PB_WITHDRAWN:
-            view["next"] = None
+        if state == PB_WITHDRAWN or state == PB_HELD:
+            view["next"] = None           # 撤回/压着都不给下一个单元
         elif pos < len(parts):
             unit = parts[pos]
             if "gap" in unit:
@@ -904,26 +1107,33 @@ class Store:
         """按稿号取一条**已开始**的回放及当前进度。
 
         稿号未知 → None（404）；稿在但还没开始 → status=not_started 的视图
-        （409 语义：还没拿稿号开始过）。"""
+        （409 语义：还没拿稿号开始过）。稿还压着时即使开始过也只回 held：
+        进度不删，但 next 为空、嵌的稿经遮罩，正文不外泄。"""
         with self._lock:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None
             pb = self._get_playback_row(draft_no)
             if pb is None:
+                status = PB_NOT_STARTED
+                if draft["is_withdrawn"]:
+                    status = PB_WITHDRAWN
+                elif draft["is_held"]:
+                    status = PB_HELD
                 return {
                     "draft_no": draft["draft_no"],
                     "call_id": draft["call_id"],
                     "draft_seq": draft["draft_seq"],
-                    "status": PB_WITHDRAWN if draft["is_withdrawn"] else PB_NOT_STARTED,
+                    "status": status,
                     "position": 0,
-                    "total_units": len(draft["parts"]),
+                    # 压着时连拼装单元数也不给（单元数会暴露缺口数）
+                    "total_units": None if draft["is_held"] else len(draft["parts"]),
                     "started_at": None,
                     "updated_at": None,
                     "finished_at": None,
                     "next": None,
                     "heard": None,
-                    "draft": draft,
+                    "draft": self.present_draft(draft),
                 }
             return self._playback_view(pb, draft)
 
@@ -942,7 +1152,7 @@ class Store:
                 " WHERE p.call_id=? ORDER BY d.draft_seq",
                 (call_id,),
             ).fetchall()
-            return [self._playback_view(r, self.get_draft(r["draft_no"])) for r in rows]
+            return [self._playback_view(r, self._load_draft(r["draft_no"])) for r in rows]
 
     # ------------------------------------------------------------------ 迟到片段
 
@@ -1027,7 +1237,7 @@ class Store:
             self._conn.execute(
                 "INSERT INTO claims(draft_no, call_id, claimed_by, claimed_at)"
                 " VALUES(?,?,?,?)",
-                (draft_no, draft["call_id"], claimed_by, _now()),
+                (draft_no, draft["call_id"], claimed_by, self._now()),
             )
             return self.get_claim(draft_no), "claimed"
 
@@ -1050,7 +1260,7 @@ class Store:
             cur = self._conn.execute(
                 "UPDATE claims SET released_at=?"
                 " WHERE draft_no=? AND released_at IS NULL",
-                (_now(), draft_no),
+                (self._now(), draft_no),
             )
             if cur.rowcount == 0:
                 return self.get_claim(draft_no), "not_claimed"
@@ -1139,6 +1349,7 @@ class Store:
         - ``"pending"``：上一次投出去还没回音 —— 不能再投一次；
         - ``"accepted"``：下游已经收下 —— 收下后不能再投；
         - ``"withdrawn"``：稿已撤回 —— 撤过的稿不能投；
+        - ``"held"``：稿还压着 —— 没到点、正文不可见，不能投；
         - ``"not_claimed"``：还没人认领 —— 没人认领的不能投；
         - ``"unknown"``：稿号不存在，视图为 None。
 
@@ -1146,7 +1357,7 @@ class Store:
         一个字不改。稿号自带 call_id、一稿一号，拿一通的号投不到另一通的稿。
         """
         with self._lock, self._conn:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None, "unknown"
             if not self._is_claimed(draft_no):
@@ -1154,6 +1365,9 @@ class Store:
                 return self.get_delivery(draft_no), "not_claimed"
             if draft["is_withdrawn"]:
                 return self.get_delivery(draft_no), "withdrawn"
+            if draft["is_held"]:
+                # 还压着不能投：不能把看不见正文的稿送到下游；到点自动解禁
+                return self.get_delivery(draft_no), "held"
             latest = self._latest_delivery_row(draft_no)
             status = self._delivery_status(latest)
             if status == self.DEL_PENDING:
@@ -1162,7 +1376,7 @@ class Store:
             if status == self.DEL_ACCEPTED:
                 return self.get_delivery(draft_no), "accepted"
             attempt = 1 if latest is None else latest["attempt"] + 1
-            now = _now()
+            now = self._now()
             self._conn.execute(
                 "INSERT INTO deliveries(draft_no, call_id, attempt, delivered_at)"
                 " VALUES(?,?,?,?)",
@@ -1177,6 +1391,7 @@ class Store:
         - ``"not_pending"``：最近一次投递已经有回音，或从没投过 —— 收下后
           不能再退，退回后也不能再退，没投过无从答复；
         - ``"withdrawn"``：稿已撤回 —— 撤过的稿不再收下游答复；
+        - ``"held"``：稿还压着 —— 压着期间不往下游办，也不收答复；
         - ``"not_claimed"``：还没人认领 —— 没认领的稿没有下游在办；
         - ``"unknown"``：稿号不存在，视图为 None。
 
@@ -1185,18 +1400,20 @@ class Store:
         当时的正文和缺口。
         """
         with self._lock, self._conn:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None, "unknown"
             if not self._is_claimed(draft_no):
                 return self.get_delivery(draft_no), "not_claimed"
             if draft["is_withdrawn"]:
                 return self.get_delivery(draft_no), "withdrawn"
+            if draft["is_held"]:
+                return self.get_delivery(draft_no), "held"
             latest = self._latest_delivery_row(draft_no)
             if latest is None or latest["accepted_at"] is not None \
                     or latest["returned_at"] is not None:
                 return self.get_delivery(draft_no), "not_pending"
-            now = _now()
+            now = self._now()
             col = "accepted_at" if accepted else "returned_at"
             cur = self._conn.execute(
                 f"UPDATE deliveries SET {col}=?"
@@ -1244,14 +1461,15 @@ class Store:
             "delivered_at": None if latest is None else latest["delivered_at"],
             "accepted_at": None if latest is None else latest["accepted_at"],
             "returned_at": None if latest is None else latest["returned_at"],
-            # 发稿当时的完整快照 —— 投递流转改不了它的正文和缺口
-            "draft": draft,
+            # 发稿当时的完整快照 —— 投递流转改不了它的正文和缺口；压着时遮罩
+            "draft": self.present_draft(draft),
         }
 
     def get_delivery(self, draft_no: str) -> dict | None:
-        """按稿号取投递总览（从未投过 status=none）。未知稿号返回 None。"""
+        """按稿号取投递总览（从未投过 status=none）。未知稿号返回 None。
+        稿还压着时只给投递状态，嵌的稿快照经遮罩，正文和缺口看不见。"""
         with self._lock:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None
             return self._delivery_view(draft)
@@ -1260,10 +1478,15 @@ class Store:
         """某通电话全部稿的投递状态（按发稿顺序）。查询本身带着 call_id，
         结构上列不出另一通电话的投递。未知 call_id 返回 None。"""
         with self._lock:
-            drafts = self.list_drafts(call_id)
-            if drafts is None:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
                 return None
-            return [self._delivery_view(d) for d in drafts]
+            rows = self._conn.execute(
+                "SELECT draft_no FROM drafts WHERE call_id=? ORDER BY draft_seq",
+                (call_id,),
+            ).fetchall()
+            return [self._delivery_view(self._load_draft(r["draft_no"])) for r in rows]
 
     # ------------------------------------------------------------------ 勘误
 
@@ -1276,6 +1499,7 @@ class Store:
         - ``"unknown_seq"``：这一段不在该稿快照里（缺口不是段、序号越出
           该稿范围）—— 勘误必须对着这一稿真实发出的段；
         - ``"withdrawn"``：稿已撤回 —— 撤过的稿不再出勘误；
+        - ``"held"``：稿还压着 —— 正文都看不见，不能对着它出勘误；
         - ``"not_claimed"``：还没人认领 —— 没人认领的不能出；
         - ``"unknown"``：稿号不存在，记录为 None。
 
@@ -1285,7 +1509,7 @@ class Store:
         通的号给另一通出不了勘误。
         """
         with self._lock, self._conn:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None, "unknown"
             if not self._is_claimed(draft_no):
@@ -1293,6 +1517,10 @@ class Store:
                 return None, "not_claimed"
             if draft["is_withdrawn"]:
                 return None, "withdrawn"
+            if draft["is_held"]:
+                # 还压着：原文不可见，不许对着看不见的正文出勘误（也防止
+                # 响应借 old_text 把正文带出去）。到点后同稿号自然放行。
+                return None, "held"
             # 对着哪一段：必须是这一稿快照里真实存在的片段（缺口不是段，
             # 越出该稿范围的序号也不是）
             text_by_seq = {p["seq"]: p["text"] for p in draft["parts"] if "text" in p}
@@ -1308,7 +1536,7 @@ class Store:
             self._conn.execute(
                 "INSERT INTO errata(draft_no, call_id, seq, old_text, new_text,"
                 " issued_at) VALUES(?,?,?,?,?,?)",
-                (draft_no, draft["call_id"], seq, text_by_seq[seq], new_text, _now()),
+                (draft_no, draft["call_id"], seq, text_by_seq[seq], new_text, self._now()),
             )
             row = self._conn.execute(
                 "SELECT * FROM errata WHERE draft_no=? AND seq=?",
@@ -1317,23 +1545,26 @@ class Store:
             return self._erratum_view(row, draft), "issued"
 
     def _erratum_view(self, r: sqlite3.Row, draft: dict) -> dict:
+        held = draft.get("is_held", False)
         return {
-            # 对的是哪一稿、哪一段、当时是什么、改成什么 —— 一清二楚
+            # 对的是哪一稿、哪一段 —— 身份信息始终在；压着时当时原文和改成
+            # 什么都是正文的一部分，一律抹成 null，到点后再拿才看得见
             "draft_no": r["draft_no"],
             "call_id": r["call_id"],
             "draft_seq": draft["draft_seq"],
             "seq": r["seq"],
-            "old_text": r["old_text"],
-            "new_text": r["new_text"],
+            "old_text": None if held else r["old_text"],
+            "new_text": None if held else r["new_text"],
             "issued_at": r["issued_at"],
-            # 当时那一稿的完整快照 —— 出勘误改不了它的正文和缺口
-            "draft": draft,
+            # 当时那一稿的完整快照 —— 出勘误改不了它的正文和缺口；压着时遮罩
+            "draft": self.present_draft(draft),
         }
 
     def get_errata(self, draft_no: str) -> dict | None:
-        """按稿号取这一稿出过的全部勘误（按段序）。未知稿号返回 None。"""
+        """按稿号取这一稿出过的全部勘误（按段序）。未知稿号返回 None。
+        稿还压着时只看得出勘了哪几段（段序），原文/改成什么/稿快照都不露。"""
         with self._lock:
-            draft = self.get_draft(draft_no)
+            draft = self._load_draft(draft_no)
             if draft is None:
                 return None
             rows = self._conn.execute(
@@ -1346,7 +1577,7 @@ class Store:
                 "draft_seq": draft["draft_seq"],
                 "errata": [self._erratum_view(r, draft) for r in rows],
                 # 当时那一稿的快照原样嵌着 —— 勘误碰不到它的正文和缺口
-                "draft": draft,
+                "draft": self.present_draft(draft),
             }
 
     def list_errata(self, call_id: str) -> list[dict] | None:
@@ -1363,125 +1594,7 @@ class Store:
                 " WHERE e.call_id=? ORDER BY d.draft_seq, e.seq",
                 (call_id,),
             ).fetchall()
-            return [self._erratum_view(r, self.get_draft(r["draft_no"])) for r in rows]
-
-    # ------------------------------------------------------------------ 两稿对照
-
-    def compare_drafts(self, draft_no_a: str, draft_no_b: str) -> tuple[dict | None, str]:
-        """按两个稿号出一张两稿对照单，返回 (对照单, 结果)。结果为：
-
-        - ``"compared"``：本次出单成功（两份一致时 mismatch_count 也为 0，
-          这仍是一次出单，之后同一对不能再对）；
-        - ``"already_compared"``：这两稿已经对过 —— 同一对稿不能对两次，
-          返回原对照单，compared_at 不动（与请求里两稿先后无关）；
-        - ``"different_call"``：两稿不是同一通电话 —— 不是同一通电话的稿不能对；
-        - ``"same_draft"``：两个稿号相同 —— 一稿没法和自己对；
-        - ``"unknown"``：任一稿号不存在，对照单为 None。
-
-        对账只读两份 drafts 的 INSERT-only 快照（parts），结果只往
-        comparisons 插一行：那两稿当时的正文和缺口一个字不改。去重键是两稿号
-        排序后的无序对 (lo_draft_no, hi_draft_no)，从结构上保证同一对只一行。
-        稿号自带 call_id，不是同一通电话的两稿在这一层就被拦下。
-        """
-        with self._lock, self._conn:
-            da = self.get_draft(draft_no_a)
-            db = self.get_draft(draft_no_b)
-            if da is None or db is None:
-                return None, "unknown"
-            if draft_no_a == draft_no_b:
-                return None, "same_draft"
-            if da["call_id"] != db["call_id"]:
-                # 不是同一通电话的稿不能对：不产生任何对照记录
-                return None, "different_call"
-
-            lo, hi = sorted((draft_no_a, draft_no_b))
-            existing = self._conn.execute(
-                "SELECT * FROM comparisons WHERE lo_draft_no=? AND hi_draft_no=?",
-                (lo, hi),
-            ).fetchone()
-            if existing is not None:
-                # 同一对稿不能对两次：原单原样返回，时间不动
-                return self._comparison_view(existing), "already_compared"
-
-            # 只把对不上的段记下来；两边同文、两边都缺的段不进单
-            mismatches = R.diff_draft_parts(da["parts"], db["parts"])
-            cur = self._conn.execute(
-                "INSERT INTO comparisons(call_id, draft_no_a, draft_no_b,"
-                " draft_seq_a, draft_seq_b, lo_draft_no, hi_draft_no,"
-                " mismatches_json, mismatch_count, compared_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    da["call_id"], draft_no_a, draft_no_b,
-                    da["draft_seq"], db["draft_seq"], lo, hi,
-                    json.dumps(mismatches, ensure_ascii=False), len(mismatches),
-                    _now(),
-                ),
-            )
-            row = self._conn.execute(
-                "SELECT * FROM comparisons WHERE id=?", (cur.lastrowid,)
-            ).fetchone()
-            return self._comparison_view(row), "compared"
-
-    def _comparison_view(self, row: sqlite3.Row) -> dict:
-        """把 comparisons 行装成对照单视图。a/b 按出单请求里的先后给，
-        两边各是哪稿、各是第几稿、每条对不上的段当时两边是什么都看得出。
-        draft_a/draft_b 是 drafts 表两份永不修改的快照 —— 对照改不了它们。"""
-        return {
-            "call_id": row["call_id"],
-            "draft_no_a": row["draft_no_a"],
-            "draft_no_b": row["draft_no_b"],
-            "draft_seq_a": row["draft_seq_a"],
-            "draft_seq_b": row["draft_seq_b"],
-            # 只含对不上的段：每条带 seq/range 与 a、b 各自当时是什么
-            "mismatches": json.loads(row["mismatches_json"]),
-            "mismatch_count": row["mismatch_count"],
-            "compared_at": row["compared_at"],
-            "draft_a": self.get_draft(row["draft_no_a"]),
-            "draft_b": self.get_draft(row["draft_no_b"]),
-        }
-
-    def _comparison_row(self, draft_no_a: str, draft_no_b: str) -> sqlite3.Row | None:
-        lo, hi = sorted((draft_no_a, draft_no_b))
-        return self._conn.execute(
-            "SELECT * FROM comparisons WHERE lo_draft_no=? AND hi_draft_no=?",
-            (lo, hi),
-        ).fetchone()
-
-    def get_comparison(self, draft_no_a: str, draft_no_b: str) -> dict | None:
-        """按两个稿号取对照单（与出单时两稿先后无关，按无序对查）。
-        没对过返回 None；调用方需自行区分稿号是否存在。"""
-        with self._lock:
-            row = self._comparison_row(draft_no_a, draft_no_b)
-            return None if row is None else self._comparison_view(row)
-
-    def list_comparisons_for_call(self, call_id: str) -> list[dict] | None:
-        """某通电话出过的全部对照单（按出单顺序）。查询本身带着 call_id，
-        结构上列不出另一通电话的对照。未知 call_id 返回 None。"""
-        with self._lock:
-            if self._conn.execute(
-                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
-            ).fetchone() is None:
-                return None
-            rows = self._conn.execute(
-                "SELECT * FROM comparisons WHERE call_id=? ORDER BY id",
-                (call_id,),
-            ).fetchall()
-            return [self._comparison_view(r) for r in rows]
-
-    def list_comparisons_for_draft(self, draft_no: str) -> list[dict] | None:
-        """涉及某一稿的全部对照单（按出单顺序，无论它在单里是 a 还是 b）。
-        未知稿号返回 None。"""
-        with self._lock:
-            if self._conn.execute(
-                "SELECT 1 FROM drafts WHERE draft_no=?", (draft_no,)
-            ).fetchone() is None:
-                return None
-            rows = self._conn.execute(
-                "SELECT * FROM comparisons"
-                " WHERE draft_no_a=? OR draft_no_b=? ORDER BY id",
-                (draft_no, draft_no),
-            ).fetchall()
-            return [self._comparison_view(r) for r in rows]
+            return [self._erratum_view(r, self._load_draft(r["draft_no"])) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对
@@ -1489,8 +1602,10 @@ class Store:
         那稿已经过时、该出新稿了；内容相同的重传不算变化。"""
         r = self._conn.execute(
             "SELECT d.draft_no, d.issued_at, d.status, d.content, d.gaps_json,"
-            " w.withdrawn_at FROM drafts d"
+            " w.withdrawn_at, h.release_at AS release_at, h.held_at AS held_at"
+            " FROM drafts d"
             " LEFT JOIN withdrawals w ON w.draft_no = d.draft_no"
+            " LEFT JOIN holds h ON h.draft_no = d.draft_no"
             " WHERE d.call_id=? ORDER BY d.draft_seq DESC LIMIT 1",
             (call_id,),
         ).fetchone()
@@ -1501,11 +1616,22 @@ class Store:
             or r["content"] != view["content"]
             or json.loads(r["gaps_json"]) != view["gaps"]
         )
+        # 最近一稿此刻是否仍压着：按当前钟点与解禁时刻比对，到点自动翻成
+        # 已解（不写任何解禁动作）。latest_draft 只是摘要，本来就不含正文。
+        is_held = (
+            r["release_at"] is not None
+            and self.now_dt() < self._parse_ts(r["release_at"])
+        )
         return {
             "draft_no": r["draft_no"],
             "issued_at": r["issued_at"],
             "withdrawn_at": r["withdrawn_at"],
             "is_withdrawn": r["withdrawn_at"] is not None,
+            "held_at": r["held_at"],
+            "release_at": r["release_at"],
+            "is_held": is_held,
+            "released": not is_held,
+            "visibility": "held" if is_held else "visible",
             "changed_since": changed,
         }
 
@@ -1590,6 +1716,15 @@ class Store:
                     "SELECT COUNT(*) AS n FROM withdrawals WHERE call_id=?",
                     (c["call_id"],),
                 ).fetchone()["n"]
+                # 此刻仍压着的稿数：到点自动解禁、不写动作，故按钟点现算
+                held_rows = self._conn.execute(
+                    "SELECT release_at FROM holds WHERE call_id=?",
+                    (c["call_id"],),
+                ).fetchall()
+                now = self.now_dt()
+                n_held = sum(
+                    1 for h in held_rows if now < self._parse_ts(h["release_at"])
+                )
                 out.append(
                     {
                         "call_id": c["call_id"],
@@ -1600,6 +1735,7 @@ class Store:
                         "conflicts": c["conflicts"],
                         "drafts_issued": n_drafts,
                         "drafts_withdrawn": n_withdrawn,
+                        "drafts_held": n_held,
                         "first_seen_at": c["first_seen_at"],
                         "last_activity_at": c["last_activity_at"],
                         "completed_at": c["completed_at"],

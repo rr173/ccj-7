@@ -115,21 +115,24 @@
   拿一通的号给另一通出不了勘误，按通话列出
   （`GET /sessions/{call_id}/errata`）也带着过滤，两通电话的勘误不串；
   勘误记录落 SQLite，重启后出过的勘误还在。
-- **发出去的两份稿要能对照**：`POST /drafts/{draft_no_a}/compare/{draft_no_b}`
-  按两个稿号出一张对照单，单上看得出是**哪两稿**（按请求先后分 a/b、各是
-  第几稿、哪通电话）、**哪一段对不上**、**两边当时各是什么**。每段的边有
-  三种：`text`（这稿当时有这段，带序号和原文）、`gap`（这稿当时这里是缺口，
-  带缺口区间和标记）、`absent`（这稿当时只到这之前，根本还没到这段）。
-  **只记对不上的段**——两边同文、两边都缺的段不进单；对账只读两份
-  `drafts` 快照、沿区间边界推进（绝不按序号逐个展开，空一大截也只出一条
-  区间记录），**绝不改那两稿当时的正文和缺口**（`drafts` 仍是 INSERT-only）。
-  **不是同一通电话的稿不能对**（409，稿号自带 `call_id`）；一稿不能和
-  自己对；**同一对稿不能对两次**（按稿号排序的无序对去重，409，原单时间
-  不动，两稿先后倒过来也是同一对）。两份完全一致时对不上的段数为 0，仍算
-  出过一次单。对照是只读对账、**不需要认领**；按通话列出
-  （`GET /sessions/{call_id}/comparisons`）或按稿列出
-  （`GET /drafts/{draft_no}/comparisons`）都带着标识，两通电话的对照不串；
-  对照单落 SQLite，**重启后对照过的还在**。
+- **有的稿得压着、写明几点几分才能见**：`POST /drafts/{draft_no}/hold`
+  按稿号把一稿压到 `release_at` 那个钟点。没到点之前，任何取稿的地方——
+  按稿号、按通话列表、签收单、认领、回放、投递、勘误——都只能知道这稿
+  **还压着、何时解**（`is_held=true`、`visibility=held`、`release_at`），
+  正文、拼装单元、缺口、缺口历史、状态等快照字段**一律为 null**；勘误
+  历史里的原文/新文本也抹掉，回放不能开始或推进、下游不能投、勘误不能出。
+  **到点不用再做任何操作**：解禁状态只由“当前钟点 ≥ release_at”实时算出，
+  再拿同一稿号，看到的就是发稿当时钉住的正文和缺口（没有“解开”这个写
+  动作，也就不可能提前解开）。约束：**解禁时刻不能早于这稿发出的时刻**
+  （422，稿不动）；**写上去就不能改、一稿只能压一次**（重复压 409，已到点
+  自动解禁后同样不能重压）；**同一通电话里，后发出的稿不能比先发出的稿
+  更早解**（409；按 `draft_seq` 与该通话已压各稿对账，同一时刻允许）。
+  压稿只往 `holds` 表插一行，绝不碰 `drafts`——压不压、解没解都不改那
+  一稿当时的正文和缺口；认领、签收、撤回等元数据动作压着期间照常。
+  `GET /drafts/{draft_no}/hold` 看这一稿压到何时、现在还压着没有（没压过
+  404），`GET /sessions/{call_id}/holds` 按通话列出。稿号自带 `call_id`，
+  两通电话的压稿不串；**重启后仍按钟点判：没到点的继续看不见，到了点的
+  不用再压一次**。
 
 ## API
 
@@ -140,7 +143,10 @@ GET  /sessions/{call_id}               单个会话完整视图（不存在返�
 POST /sessions/{call_id}/drafts        把当前视图钉成一稿对外给出，返回稿号（201）
 GET  /sessions/{call_id}/drafts        该通话已发出的全部稿（按发稿顺序）
 GET  /sessions/{call_id}/drafts/{n}    取该通话的第 n 稿
-GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿
+GET  /drafts/{draft_no}                按稿号取已发稿 —— 永远是当时那一稿；压着时只给“还压着、何时解”
+POST /drafts/{draft_no}/hold            把稿压到指定时刻才见（201；压过 409；早于发稿 422；解禁逆序 409）
+GET  /drafts/{draft_no}/hold            这一稿压到何时、现在还压着没有（没压过 404）
+GET  /sessions/{call_id}/holds          该通话压过的全部稿（按发稿顺序）
 POST /drafts/{draft_no}/receipt        按稿号签收（201；已签过 409；未知稿号 404）
 GET  /drafts/{draft_no}/receipt        该稿的签收单（待签/已签 + 当时那稿的正文和缺口）
 GET  /sessions/{call_id}/receipts      该通话的全部签收单（按发稿顺序）
@@ -165,13 +171,6 @@ GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按
 POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409；未知稿号 404）
 GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
 GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
-POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409）
-GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
-GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
-POST /drafts/{draft_no_a}/compare/{draft_no_b}  按两个稿号出两稿对照单（201；非同通话/同稿/同一对已对过 409；未知稿号 404）
-GET  /drafts/{draft_no_a}/compare/{draft_no_b}  取这两稿的对照单（没对过 404；与两稿先后无关）
-GET  /sessions/{call_id}/comparisons     该通话出过的全部对照单（按出单顺序）
-GET  /drafts/{draft_no}/comparisons      涉及这一稿的全部对照单（它在单里作 a 或 b 都列）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -186,8 +185,12 @@ GET  /docs                             Swagger UI
 `status`/`content`/`gaps`（发稿那一刻的状态、正文、缺口）、`gap_history`
 （截至当时的缺口历史）、`supersedes`（本稿订正的上一稿稿号）、
 `predecessor_had_gaps`/`predecessor_gaps`（上一稿当时是否带缺口、缺在哪）、
-`issued_at`、`is_withdrawn`/`withdrawn_at`（是否撤回、撤回时刻）。稿一旦
-发出即冻结，撤回只叠加状态，任何后续片段或撤回动作都不会改变其正文和缺口。
+`issued_at`、`is_withdrawn`/`withdrawn_at`（是否撤回、撤回时刻）、
+`is_held`/`released`/`release_at`/`held_at`/`visibility`（是否仍压着、是否
+已到点、解禁时刻、压稿时刻、`held`/`visible`）。稿一旦发出即冻结，撤回只
+叠加状态；稿压着时正文、拼装单元、缺口、状态等字段一律为 `null`，到点后
+同一稿号自动恢复为当时的正文和缺口，任何后续片段或撤回动作都不会改变其
+正文和缺口。
 
 签收单（receipt）关键字段：`draft_no`/`call_id`/`draft_seq`（签的是哪一稿）、
 `status`（`pending` 待签 / `signed` 已签 / `withdrawn` 已撤回）、
@@ -239,18 +242,6 @@ GET  /docs                             Swagger UI
 `draft`（当时那一稿的完整快照——勘误改不了它的正文和缺口）。没人认领不能
 出；同一段不能出两次；缺口和越界序号不是段；撤过的稿不能出。勘误只写
 `errata` 表，从不修改 `drafts`。
-
-对照单（comparison）关键字段：`call_id`（两稿同属的那通电话）、
-`draft_no_a`/`draft_no_b` 与 `draft_seq_a`/`draft_seq_b`（对的是哪两稿、
-各是第几稿——a/b 按出单请求里的先后）、`mismatches`（**只含对不上的段**，
-按段序升序）、`mismatch_count`、`compared_at`（出单时刻）、
-`draft_a`/`draft_b`（两份发稿当时的完整快照，对照改不了它们的正文和缺口）。
-每条 mismatch 用 `seq`（点段）或 `range`（区间段）定位，下挂 `a`/`b` 两边
-当时的样子：`{"kind":"text","seq","text"}`（这稿当时有这段）、
-`{"kind":"gap","gap":[lo,hi],"marker"}`（这稿当时这里缺）、
-`{"kind":"absent"}`（这稿当时还没到这段）。两边同文、两边都缺的段不进单。
-不是同一通电话的稿不能对；一稿不能和自己对；同一对稿不能对两次。对照单只
-写 `comparisons` 表，从不修改 `drafts`。
 
 ### 示例
 
@@ -482,36 +473,33 @@ curl localhost:8000/drafts/C1-D0001/errata   # 这一稿出过的全部勘误
 curl localhost:8000/sessions/C1/errata       # 该通话出过的全部勘误（重启后还在）
 ```
 
-### 两稿对照
+### 压到点才见
 
 ```bash
-# C1-D0001 缺着第 3 段发出；第 3 段补上后另发 C1-D0002
-# 按两个稿号出对照单：看得出是哪两稿、哪一段对不上、两边当时各是什么
-curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0002
-# {"call_id":"C1","draft_no_a":"C1-D0001","draft_no_b":"C1-D0002",
-#  "draft_seq_a":1,"draft_seq_b":2,"mismatch_count":1,
-#  "mismatches":[{"seq":3,
-#    "a":{"kind":"gap","gap":[3,3],"marker":"[缺口:片段3]"},
-#    "b":{"kind":"text","seq":3,"text":"信号不太好"}}],
-#  "compared_at":"...","draft_a":{...当时那稿...},"draft_b":{...当时那稿...}}
-# 第 1、2、4 段两边同文 → 不进单；只记对不上的段
+# 稿照常发出（此刻即 INSERT-only 快照落库），再写明几点几分解禁
+curl -X POST localhost:8000/sessions/C1/drafts            # C1-D0001
+curl -X POST localhost:8000/drafts/C1-D0001/hold \
+     -H 'Content-Type: application/json' \
+     -d '{"release_at":"2026-09-11T14:00:00Z"}'
+# 201：{"draft_no":"C1-D0001","is_held":true,"released":false,
+#       "visibility":"held","release_at":"2026-09-11T14:00:00Z",
+#       "content":null,"parts":null,"gaps":null,"status":null,...}
 
-# 两稿先后倒过来取，取到的是同一张单（a/b 仍是出单时的先后）
-curl localhost:8000/drafts/C1-D0002/compare/C1-D0001
+# 没到点：只能知道还压着、何时解，正文和缺口全是 null
+curl localhost:8000/drafts/C1-D0001
+# {"visibility":"held","release_at":"...","content":null,"gaps":null,...}
 
-# 不是同一通电话的稿不能对；同一对不能对两次（409，原单时间不动）
-curl -X POST localhost:8000/drafts/C1-D0001/compare/C2-D0001   # 409
-curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0002   # 409 already compared
+# 一稿只能压一次（改时刻/提前解都 409）；解禁时刻早于发稿时刻 422
+curl -X POST localhost:8000/drafts/C1-D0001/hold \
+     -H 'Content-Type: application/json' -d '{"release_at":"2026-09-11T13:00:00Z"}'
+# 409 draft already held
 
-# 一稿不能和自己对
-curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0001   # 409
+# 到点后无需任何操作，同一稿号再拿就是发稿当时的正文和缺口
+curl localhost:8000/drafts/C1-D0001
+# {"visibility":"visible","is_held":false,"content":"...当时的正文...","gaps":[...]}
 
-# 对照只读两份发稿快照：那两稿当时的正文和缺口一个字不变
-curl localhost:8000/drafts/C1-D0001            # 仍是含 [缺口:片段3] 的样子
-
-# 按通话列全部对照单、按稿列涉及这一稿的对照单（重启后还在）
-curl localhost:8000/sessions/C1/comparisons
-curl localhost:8000/drafts/C1-D0001/comparisons
+# 同一通电话后发的稿不能更早解（C1-D0002 的 release_at 早于 D0001 → 409）；
+# 另一通电话各压各的，互不约束；重启后仍按钟点判，没到点继续看不见。
 ```
 
 ## 运行
@@ -544,7 +532,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           99 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           114 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -562,11 +550,10 @@ tests/           99 个测试：乱序、重传、通话隔离、缺口（含越
                  了还在、与撤回互斥），勘误（按稿号对段出、看得出哪稿哪段改成
                  什么、不改那一稿正文缺口、没认领不能出、同一段不能出两次、
                  缺口不是段、撤过不能出、已签已投照样能出、两通电话不串、
-                 重启后勘误还在），两稿对照（按两个稿号出单、看得出哪两稿哪段
-                 两边各是什么、只记对不上的段、两边同文或两边都缺不记、
-                 对照不改正文缺口、不需要认领、非同通话不能对、同稿不能自对、
-                 同一对不能对两次且倒序同对、两份一致时空单、两通电话不串、
-                 重启后对照还在）
+                 重启后勘误还在），定时压稿（没到点只见“还压着、何时解”、
+                 正文缺口全遮、到点无需操作自动可见、解禁不早于发稿、写定不改
+                 不提前解、一稿只能压一次、后发稿不更早解、压着时回放/投递/
+                 勘误都被拦住且各视图不泄正文、两通电话不串、重启后按钟点判）
 Dockerfile / docker-compose.yml
 ```
 
