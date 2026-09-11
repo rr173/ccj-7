@@ -130,6 +130,105 @@ def join_content(parts: list[dict]) -> str:
     return "\n".join(p["text"] if "text" in p else p["marker"] for p in parts)
 
 
+# ------------------------------------------------------------ 两稿对照
+
+def _diff_units(parts: list[dict]) -> list[tuple[int, int, str, dict]]:
+    """把拼装单元归一成 (lo, hi, kind, 原单元)：文本段是点 [seq,seq]，
+    缺口段是区间 [lo,hi]。单元顺序拼接即严丝合缝覆盖 1..top。"""
+    units = []
+    for p in parts:
+        if "text" in p:
+            units.append((p["seq"], p["seq"], "text", p))
+        else:
+            lo, hi = p["gap"]
+            units.append((lo, hi, "gap", p))
+    return units
+
+
+def _diff_gap_side(lo: int, hi: int) -> dict:
+    return {"kind": "gap", "gap": [lo, hi], "marker": gap_marker(lo, hi)}
+
+
+def _diff_text_side(p: dict) -> dict:
+    return {"kind": "text", "seq": p["seq"], "text": p["text"]}
+
+
+def _diff_tail_record(lo: int, hi: int, unit: tuple | None, side: str) -> dict:
+    """只有一边覆盖到的段（另一边那稿短、还没到这段）。side 指明 unit 是
+    a 还是 b；另一边记 absent。点段单元始终是点 [n,n]，缺口单元可能是区间。"""
+    present = (
+        _diff_gap_side(lo, hi) if unit[2] == "gap" else _diff_text_side(unit[3])
+    ) if unit is not None else {"kind": "absent"}
+    rec = {"seq": lo} if lo == hi else {"range": [lo, hi]}
+    rec["a"] = present if side == "a" else {"kind": "absent"}
+    rec["b"] = present if side == "b" else {"kind": "absent"}
+    return rec
+
+
+def diff_draft_parts(parts_a: list[dict], parts_b: list[dict]) -> list[dict]:
+    """对照两份**稿快照**的拼装单元，只把对不上的段记下来（按段序升序）。
+
+    两边一致的段不记：两边都是同一文本的点段一致；两边都缺（无论缺口区间
+    各自多大，重叠部分）也一致 —— 两稿当时都没有这段，没什么可对的。
+    对不上的段分两种记法：
+
+    - 点段（lo==hi）：``{"seq": n, "a": 边, "b": 边}``，边为
+      ``{"kind":"text","seq","text"}``（这一稿当时有这段）、
+      ``{"kind":"gap","gap":[n,n],"marker"}``（这一稿当时这里缺）或
+      ``{"kind":"absent"}``（这一稿当时只到这之前，根本没到这段）；
+    - 区间段（lo<hi）：``{"range":[lo,hi], ...}`` —— 只可能是一边整段缺口、
+      另一边那稿还没到这里（absent），点段文本不会产生区间。
+
+    全程沿区间边界推进、绝不按序号逐个展开：空一大截也只出一条区间记录。
+    """
+    ua = _diff_units(parts_a)
+    ub = _diff_units(parts_b)
+    na, nb = len(ua), len(ub)
+    i = j = 0
+    la = ua[0][0] if na else 0   # 当前单元的有效起点（区间可能被对边切成小片）
+    lb = ub[0][0] if nb else 0
+    out: list[dict] = []
+
+    while i < na or j < nb:
+        if i >= na:
+            out.append(_diff_tail_record(lb, ub[j][1], ub[j], "b"))
+            j += 1
+            lb = ub[j][0] if j < nb else 0
+            continue
+        if j >= nb:
+            out.append(_diff_tail_record(la, ua[i][1], ua[i], "a"))
+            i += 1
+            la = ua[i][0] if i < na else 0
+            continue
+
+        A, B = ua[i], ub[j]
+        lo = la                      # 两表都从 1 严丝合缝拼起，游标始终对齐
+        hi = min(A[1], B[1])
+        ka, kb = A[2], B[2]
+        if ka == "gap" and kb == "gap":
+            pass                     # 两边这段都缺：一致，不记
+        elif lo == hi and ka == "text" and kb == "text" \
+                and A[3]["text"] == B[3]["text"]:
+            pass                     # 同一段、两边正文一字不差：一致，不记
+        else:
+            # 文本点只会切出点段（hi==lo）；点段缺口按这一个号给标记
+            sa = _diff_text_side(A[3]) if ka == "text" else _diff_gap_side(lo, hi)
+            sb = _diff_text_side(B[3]) if kb == "text" else _diff_gap_side(lo, hi)
+            out.append({"seq": lo, "a": sa, "b": sb})
+
+        if A[1] == hi:
+            i += 1
+            la = ua[i][0] if i < na else 0
+        else:
+            la = hi + 1             # A 的缺口区间被对边切下一小片，剩余部分继续
+        if B[1] == hi:
+            j += 1
+            lb = ub[j][0] if j < nb else 0
+        else:
+            lb = hi + 1
+    return out
+
+
 def status_of(seqs: set[int], last_seq: int | None, had_gap: bool = False) -> str:
     """判定会话状态。宁可报“还在拼/有缺口”，绝不假装完整。
 

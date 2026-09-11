@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十一张表（前十张 + 勘误的 errata）：
+十一张表（前十张 + 勘误的 errata），另有两稿对照的 comparisons 共十二张：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -68,6 +68,17 @@
                drafts —— 那一稿当时的正文和缺口一个字不改。稿号自带
                call_id，拿一通的号给另一通出不了勘误；记录落 SQLite，
                重启后出过的勘误还在。
+- comparisons: 两稿对照单 —— 发出去的两份稿要能对着看。每次出单钉住是哪两
+               稿（draft_no_a/b，按请求里的先后分 a、b）、同一通电话
+               （call_id）、以及**只含对不上的段**的对照结果（mismatches），
+               每条记下段序号/区间、a 当时是什么、b 当时是什么（文本段 /
+               该稿当时的缺口 / 这稿还没到这段 absent）。对账只读两份
+               drafts 快照、沿区间边界推进，绝不 UPDATE drafts —— 对照改
+               不了那两稿当时的正文和缺口；一致的段（两边同文、或两边都缺）
+               不进单。UNIQUE(lo_draft_no, hi_draft_no) 按稿号排序后的无序
+               对去重：同一对稿不能对两次（409，原单时间不动）；稿号自带
+               call_id，不是同一通电话的两稿不进对照（409）。记录落 SQLite，
+               重启后对照过的还在。
 """
 
 from __future__ import annotations
@@ -196,6 +207,21 @@ CREATE TABLE IF NOT EXISTS errata (
 );
 CREATE INDEX IF NOT EXISTS idx_errata_draft ON errata(draft_no);
 CREATE INDEX IF NOT EXISTS idx_errata_call ON errata(call_id);
+CREATE TABLE IF NOT EXISTS comparisons (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- 出单顺序
+    call_id        TEXT NOT NULL,      -- 两稿必须同属一通电话（随稿号校验）
+    draft_no_a     TEXT NOT NULL REFERENCES drafts(draft_no),  -- 请求里的第一稿
+    draft_no_b     TEXT NOT NULL REFERENCES drafts(draft_no),  -- 请求里的第二稿
+    draft_seq_a    INTEGER NOT NULL,   -- 第一稿是该通话第几稿
+    draft_seq_b    INTEGER NOT NULL,   -- 第二稿是该通话第几稿
+    lo_draft_no    TEXT NOT NULL,      -- 两稿号排序后较小者：无序对去重键
+    hi_draft_no    TEXT NOT NULL,      -- 两稿号排序后较大者
+    mismatches_json TEXT NOT NULL,     -- 只含对不上的段（a/b 各自当时是什么）
+    mismatch_count INTEGER NOT NULL,   -- 对不上的段数（可能为 0：两份一致）
+    compared_at    TEXT NOT NULL,      -- 出单时刻
+    UNIQUE (lo_draft_no, hi_draft_no)  -- 同一对稿不能对两次
+);
+CREATE INDEX IF NOT EXISTS idx_comparisons_call ON comparisons(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1338,6 +1364,124 @@ class Store:
                 (call_id,),
             ).fetchall()
             return [self._erratum_view(r, self.get_draft(r["draft_no"])) for r in rows]
+
+    # ------------------------------------------------------------------ 两稿对照
+
+    def compare_drafts(self, draft_no_a: str, draft_no_b: str) -> tuple[dict | None, str]:
+        """按两个稿号出一张两稿对照单，返回 (对照单, 结果)。结果为：
+
+        - ``"compared"``：本次出单成功（两份一致时 mismatch_count 也为 0，
+          这仍是一次出单，之后同一对不能再对）；
+        - ``"already_compared"``：这两稿已经对过 —— 同一对稿不能对两次，
+          返回原对照单，compared_at 不动（与请求里两稿先后无关）；
+        - ``"different_call"``：两稿不是同一通电话 —— 不是同一通电话的稿不能对；
+        - ``"same_draft"``：两个稿号相同 —— 一稿没法和自己对；
+        - ``"unknown"``：任一稿号不存在，对照单为 None。
+
+        对账只读两份 drafts 的 INSERT-only 快照（parts），结果只往
+        comparisons 插一行：那两稿当时的正文和缺口一个字不改。去重键是两稿号
+        排序后的无序对 (lo_draft_no, hi_draft_no)，从结构上保证同一对只一行。
+        稿号自带 call_id，不是同一通电话的两稿在这一层就被拦下。
+        """
+        with self._lock, self._conn:
+            da = self.get_draft(draft_no_a)
+            db = self.get_draft(draft_no_b)
+            if da is None or db is None:
+                return None, "unknown"
+            if draft_no_a == draft_no_b:
+                return None, "same_draft"
+            if da["call_id"] != db["call_id"]:
+                # 不是同一通电话的稿不能对：不产生任何对照记录
+                return None, "different_call"
+
+            lo, hi = sorted((draft_no_a, draft_no_b))
+            existing = self._conn.execute(
+                "SELECT * FROM comparisons WHERE lo_draft_no=? AND hi_draft_no=?",
+                (lo, hi),
+            ).fetchone()
+            if existing is not None:
+                # 同一对稿不能对两次：原单原样返回，时间不动
+                return self._comparison_view(existing), "already_compared"
+
+            # 只把对不上的段记下来；两边同文、两边都缺的段不进单
+            mismatches = R.diff_draft_parts(da["parts"], db["parts"])
+            cur = self._conn.execute(
+                "INSERT INTO comparisons(call_id, draft_no_a, draft_no_b,"
+                " draft_seq_a, draft_seq_b, lo_draft_no, hi_draft_no,"
+                " mismatches_json, mismatch_count, compared_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    da["call_id"], draft_no_a, draft_no_b,
+                    da["draft_seq"], db["draft_seq"], lo, hi,
+                    json.dumps(mismatches, ensure_ascii=False), len(mismatches),
+                    _now(),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM comparisons WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+            return self._comparison_view(row), "compared"
+
+    def _comparison_view(self, row: sqlite3.Row) -> dict:
+        """把 comparisons 行装成对照单视图。a/b 按出单请求里的先后给，
+        两边各是哪稿、各是第几稿、每条对不上的段当时两边是什么都看得出。
+        draft_a/draft_b 是 drafts 表两份永不修改的快照 —— 对照改不了它们。"""
+        return {
+            "call_id": row["call_id"],
+            "draft_no_a": row["draft_no_a"],
+            "draft_no_b": row["draft_no_b"],
+            "draft_seq_a": row["draft_seq_a"],
+            "draft_seq_b": row["draft_seq_b"],
+            # 只含对不上的段：每条带 seq/range 与 a、b 各自当时是什么
+            "mismatches": json.loads(row["mismatches_json"]),
+            "mismatch_count": row["mismatch_count"],
+            "compared_at": row["compared_at"],
+            "draft_a": self.get_draft(row["draft_no_a"]),
+            "draft_b": self.get_draft(row["draft_no_b"]),
+        }
+
+    def _comparison_row(self, draft_no_a: str, draft_no_b: str) -> sqlite3.Row | None:
+        lo, hi = sorted((draft_no_a, draft_no_b))
+        return self._conn.execute(
+            "SELECT * FROM comparisons WHERE lo_draft_no=? AND hi_draft_no=?",
+            (lo, hi),
+        ).fetchone()
+
+    def get_comparison(self, draft_no_a: str, draft_no_b: str) -> dict | None:
+        """按两个稿号取对照单（与出单时两稿先后无关，按无序对查）。
+        没对过返回 None；调用方需自行区分稿号是否存在。"""
+        with self._lock:
+            row = self._comparison_row(draft_no_a, draft_no_b)
+            return None if row is None else self._comparison_view(row)
+
+    def list_comparisons_for_call(self, call_id: str) -> list[dict] | None:
+        """某通电话出过的全部对照单（按出单顺序）。查询本身带着 call_id，
+        结构上列不出另一通电话的对照。未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM comparisons WHERE call_id=? ORDER BY id",
+                (call_id,),
+            ).fetchall()
+            return [self._comparison_view(r) for r in rows]
+
+    def list_comparisons_for_draft(self, draft_no: str) -> list[dict] | None:
+        """涉及某一稿的全部对照单（按出单顺序，无论它在单里是 a 还是 b）。
+        未知稿号返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM drafts WHERE draft_no=?", (draft_no,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM comparisons"
+                " WHERE draft_no_a=? OR draft_no_b=? ORDER BY id",
+                (draft_no, draft_no),
+            ).fetchall()
+            return [self._comparison_view(r) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对

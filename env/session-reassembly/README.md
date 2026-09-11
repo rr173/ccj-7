@@ -115,6 +115,21 @@
   拿一通的号给另一通出不了勘误，按通话列出
   （`GET /sessions/{call_id}/errata`）也带着过滤，两通电话的勘误不串；
   勘误记录落 SQLite，重启后出过的勘误还在。
+- **发出去的两份稿要能对照**：`POST /drafts/{draft_no_a}/compare/{draft_no_b}`
+  按两个稿号出一张对照单，单上看得出是**哪两稿**（按请求先后分 a/b、各是
+  第几稿、哪通电话）、**哪一段对不上**、**两边当时各是什么**。每段的边有
+  三种：`text`（这稿当时有这段，带序号和原文）、`gap`（这稿当时这里是缺口，
+  带缺口区间和标记）、`absent`（这稿当时只到这之前，根本还没到这段）。
+  **只记对不上的段**——两边同文、两边都缺的段不进单；对账只读两份
+  `drafts` 快照、沿区间边界推进（绝不按序号逐个展开，空一大截也只出一条
+  区间记录），**绝不改那两稿当时的正文和缺口**（`drafts` 仍是 INSERT-only）。
+  **不是同一通电话的稿不能对**（409，稿号自带 `call_id`）；一稿不能和
+  自己对；**同一对稿不能对两次**（按稿号排序的无序对去重，409，原单时间
+  不动，两稿先后倒过来也是同一对）。两份完全一致时对不上的段数为 0，仍算
+  出过一次单。对照是只读对账、**不需要认领**；按通话列出
+  （`GET /sessions/{call_id}/comparisons`）或按稿列出
+  （`GET /drafts/{draft_no}/comparisons`）都带着标识，两通电话的对照不串；
+  对照单落 SQLite，**重启后对照过的还在**。
 
 ## API
 
@@ -150,6 +165,13 @@ GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按
 POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409；未知稿号 404）
 GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
 GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
+POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409）
+GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
+GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
+POST /drafts/{draft_no_a}/compare/{draft_no_b}  按两个稿号出两稿对照单（201；非同通话/同稿/同一对已对过 409；未知稿号 404）
+GET  /drafts/{draft_no_a}/compare/{draft_no_b}  取这两稿的对照单（没对过 404；与两稿先后无关）
+GET  /sessions/{call_id}/comparisons     该通话出过的全部对照单（按出单顺序）
+GET  /drafts/{draft_no}/comparisons      涉及这一稿的全部对照单（它在单里作 a 或 b 都列）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -217,6 +239,18 @@ GET  /docs                             Swagger UI
 `draft`（当时那一稿的完整快照——勘误改不了它的正文和缺口）。没人认领不能
 出；同一段不能出两次；缺口和越界序号不是段；撤过的稿不能出。勘误只写
 `errata` 表，从不修改 `drafts`。
+
+对照单（comparison）关键字段：`call_id`（两稿同属的那通电话）、
+`draft_no_a`/`draft_no_b` 与 `draft_seq_a`/`draft_seq_b`（对的是哪两稿、
+各是第几稿——a/b 按出单请求里的先后）、`mismatches`（**只含对不上的段**，
+按段序升序）、`mismatch_count`、`compared_at`（出单时刻）、
+`draft_a`/`draft_b`（两份发稿当时的完整快照，对照改不了它们的正文和缺口）。
+每条 mismatch 用 `seq`（点段）或 `range`（区间段）定位，下挂 `a`/`b` 两边
+当时的样子：`{"kind":"text","seq","text"}`（这稿当时有这段）、
+`{"kind":"gap","gap":[lo,hi],"marker"}`（这稿当时这里缺）、
+`{"kind":"absent"}`（这稿当时还没到这段）。两边同文、两边都缺的段不进单。
+不是同一通电话的稿不能对；一稿不能和自己对；同一对稿不能对两次。对照单只
+写 `comparisons` 表，从不修改 `drafts`。
 
 ### 示例
 
@@ -448,6 +482,38 @@ curl localhost:8000/drafts/C1-D0001/errata   # 这一稿出过的全部勘误
 curl localhost:8000/sessions/C1/errata       # 该通话出过的全部勘误（重启后还在）
 ```
 
+### 两稿对照
+
+```bash
+# C1-D0001 缺着第 3 段发出；第 3 段补上后另发 C1-D0002
+# 按两个稿号出对照单：看得出是哪两稿、哪一段对不上、两边当时各是什么
+curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0002
+# {"call_id":"C1","draft_no_a":"C1-D0001","draft_no_b":"C1-D0002",
+#  "draft_seq_a":1,"draft_seq_b":2,"mismatch_count":1,
+#  "mismatches":[{"seq":3,
+#    "a":{"kind":"gap","gap":[3,3],"marker":"[缺口:片段3]"},
+#    "b":{"kind":"text","seq":3,"text":"信号不太好"}}],
+#  "compared_at":"...","draft_a":{...当时那稿...},"draft_b":{...当时那稿...}}
+# 第 1、2、4 段两边同文 → 不进单；只记对不上的段
+
+# 两稿先后倒过来取，取到的是同一张单（a/b 仍是出单时的先后）
+curl localhost:8000/drafts/C1-D0002/compare/C1-D0001
+
+# 不是同一通电话的稿不能对；同一对不能对两次（409，原单时间不动）
+curl -X POST localhost:8000/drafts/C1-D0001/compare/C2-D0001   # 409
+curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0002   # 409 already compared
+
+# 一稿不能和自己对
+curl -X POST localhost:8000/drafts/C1-D0001/compare/C1-D0001   # 409
+
+# 对照只读两份发稿快照：那两稿当时的正文和缺口一个字不变
+curl localhost:8000/drafts/C1-D0001            # 仍是含 [缺口:片段3] 的样子
+
+# 按通话列全部对照单、按稿列涉及这一稿的对照单（重启后还在）
+curl localhost:8000/sessions/C1/comparisons
+curl localhost:8000/drafts/C1-D0001/comparisons
+```
+
 ## 运行
 
 ### Docker
@@ -496,7 +562,11 @@ tests/           99 个测试：乱序、重传、通话隔离、缺口（含越
                  了还在、与撤回互斥），勘误（按稿号对段出、看得出哪稿哪段改成
                  什么、不改那一稿正文缺口、没认领不能出、同一段不能出两次、
                  缺口不是段、撤过不能出、已签已投照样能出、两通电话不串、
-                 重启后勘误还在）
+                 重启后勘误还在），两稿对照（按两个稿号出单、看得出哪两稿哪段
+                 两边各是什么、只记对不上的段、两边同文或两边都缺不记、
+                 对照不改正文缺口、不需要认领、非同通话不能对、同稿不能自对、
+                 同一对不能对两次且倒序同对、两份一致时空单、两通电话不串、
+                 重启后对照还在）
 Dockerfile / docker-compose.yml
 ```
 

@@ -31,6 +31,10 @@
     POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409）
     GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
     GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
+    POST /drafts/{draft_no_a}/compare/{draft_no_b}  按两个稿号出两稿对照单（只记对不上的段）
+    GET  /drafts/{draft_no_a}/compare/{draft_no_b}  取这两稿的对照单（没对过 404）
+    GET  /sessions/{call_id}/comparisons     该通话出过的全部对照单（按出单顺序）
+    GET  /drafts/{draft_no}/comparisons      涉及这一稿的全部对照单
     GET  /healthz                            健康检查
 
     发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回、不能
@@ -53,7 +57,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.8.0",
+        version="1.9.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -387,6 +391,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if errata is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"errata": errata}
+
+    # -------------------------------------------------------------- 两稿对照
+
+    @app.post("/drafts/{draft_no_a}/compare/{draft_no_b}", status_code=201)
+    def compare_drafts(draft_no_a: str, draft_no_b: str):
+        """按两个稿号出一张两稿对照单：单上看得出是哪两稿、哪一段、两边当时
+        各是什么，只把对不上的段记下来（两边同文、两边都缺的段不进单）。
+        对照只读两份发稿快照，不改那两稿当时的正文和缺口。
+        不是同一通电话的两稿不能对；同一对稿不能对两次（409，原单时间不动）；
+        两稿号相同也不能对（409）。201 本次出单；任一稿号未知 404。"""
+        comparison, result = store.compare_drafts(draft_no_a, draft_no_b)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "same_draft":
+            raise HTTPException(status_code=409, detail="cannot compare a draft with itself")
+        if result == "different_call":
+            raise HTTPException(status_code=409, detail="drafts are not from the same call")
+        if result == "already_compared":
+            raise HTTPException(status_code=409, detail="drafts already compared")
+        return comparison
+
+    @app.get("/drafts/{draft_no_a}/compare/{draft_no_b}")
+    def get_comparison(draft_no_a: str, draft_no_b: str):
+        """取这两稿的对照单（与出单时两稿先后无关）。单里嵌的两份稿仍是各自
+        发稿那一刻的正文和缺口。没对过 404；任一稿号未知 404。"""
+        if store.get_draft(draft_no_a) is None or store.get_draft(draft_no_b) is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        comparison = store.get_comparison(draft_no_a, draft_no_b)
+        if comparison is None:
+            raise HTTPException(status_code=404, detail="comparison not found")
+        return comparison
+
+    @app.get("/sessions/{call_id}/comparisons")
+    def list_comparisons(call_id: str):
+        """该通话出过的全部对照单（按出单顺序）。查询带 call_id，
+        结构上列不出另一通电话的对照。"""
+        comparisons = store.list_comparisons_for_call(call_id)
+        if comparisons is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"comparisons": comparisons}
+
+    @app.get("/drafts/{draft_no}/comparisons")
+    def list_comparisons_for_draft(draft_no: str):
+        """涉及这一稿的全部对照单（无论它在单里是第一稿还是第二稿）。"""
+        comparisons = store.list_comparisons_for_draft(draft_no)
+        if comparisons is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return {"draft_no": draft_no, "comparisons": comparisons}
 
     # -------------------------------------------------------------- 迟到片段
 
