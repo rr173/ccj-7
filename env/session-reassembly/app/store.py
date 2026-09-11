@@ -3,7 +3,7 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十张表（前九张 + 下游投递的 deliveries）：
+十一张表（前十张 + 勘误的 errata）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -59,6 +59,15 @@
                投递只往本表插行、只填自己的回音时间：drafts 里那一稿当时的
                正文、parts、缺口一个字不改。稿号自带 call_id，拿一通的号投
                不到另一通的稿；记录落 SQLite，重启后投到哪了还在。
+- errata     : 勘误记录 —— 发出去的稿按**稿号**对某一段出勘误，一段至多
+               一条（UNIQUE(draft_no, seq)：同一段不能出两次）。每行钉住
+               对的是哪一稿、哪一段、当时的原文（old_text，取自该稿快照）
+               和改成什么（new_text），看得出"哪一稿的哪一段改成什么"。
+               没人认领的不能出；撤回的稿不能出；对着的段必须是该稿快照里
+               真实存在的片段（缺口不是段）。勘误只往本表插行，绝不碰
+               drafts —— 那一稿当时的正文和缺口一个字不改。稿号自带
+               call_id，拿一通的号给另一通出不了勘误；记录落 SQLite，
+               重启后出过的勘误还在。
 """
 
 from __future__ import annotations
@@ -175,6 +184,18 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_draft ON deliveries(draft_no);
 CREATE INDEX IF NOT EXISTS idx_deliveries_call ON deliveries(call_id);
+CREATE TABLE IF NOT EXISTS errata (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 勘误顺序
+    draft_no    TEXT NOT NULL REFERENCES drafts(draft_no),  -- 对哪一稿出的
+    call_id     TEXT NOT NULL,      -- 随稿号所属通话，按通话查/隔离都带着它
+    seq         INTEGER NOT NULL,   -- 对着哪一段（该稿快照里的片段序号）
+    old_text    TEXT NOT NULL,      -- 那一稿当时该段的原文（钉住，看得出对着什么改）
+    new_text    TEXT NOT NULL,      -- 改成什么
+    issued_at   TEXT NOT NULL,      -- 出勘误的时刻
+    UNIQUE (draft_no, seq)          -- 同一段不能出两次
+);
+CREATE INDEX IF NOT EXISTS idx_errata_draft ON errata(draft_no);
+CREATE INDEX IF NOT EXISTS idx_errata_call ON errata(call_id);
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1217,6 +1238,106 @@ class Store:
             if drafts is None:
                 return None
             return [self._delivery_view(d) for d in drafts]
+
+    # ------------------------------------------------------------------ 勘误
+
+    def issue_errata(self, draft_no: str, seq: int, new_text: str) -> tuple[dict | None, str]:
+        """按稿号对一稿的某一段出勘误，返回 (勘误记录, 结果)。结果为：
+
+        - ``"issued"``：本次勘误出具成功；
+        - ``"already_issued"``：这一稿的这一段已经出过 —— 同一段不能出两次，
+          返回原勘误记录，时间不动；
+        - ``"unknown_seq"``：这一段不在该稿快照里（缺口不是段、序号越出
+          该稿范围）—— 勘误必须对着这一稿真实发出的段；
+        - ``"withdrawn"``：稿已撤回 —— 撤过的稿不再出勘误；
+        - ``"not_claimed"``：还没人认领 —— 没人认领的不能出；
+        - ``"unknown"``：稿号不存在，记录为 None。
+
+        勘误只往 errata 插一行：drafts 里那一稿当时的正文、parts、缺口一个
+        字不改。old_text 取自该稿快照并随记录钉住，勘误单自带"对的是哪一稿
+        的哪一段、当时是什么、改成什么"。稿号自带 call_id、一稿一号，拿一
+        通的号给另一通出不了勘误。
+        """
+        with self._lock, self._conn:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None, "unknown"
+            if not self._is_claimed(draft_no):
+                # 没人认领的不能出：不产生任何勘误记录，等有人认领后再出
+                return None, "not_claimed"
+            if draft["is_withdrawn"]:
+                return None, "withdrawn"
+            # 对着哪一段：必须是这一稿快照里真实存在的片段（缺口不是段，
+            # 越出该稿范围的序号也不是）
+            text_by_seq = {p["seq"]: p["text"] for p in draft["parts"] if "text" in p}
+            if seq not in text_by_seq:
+                return None, "unknown_seq"
+            existing = self._conn.execute(
+                "SELECT * FROM errata WHERE draft_no=? AND seq=?",
+                (draft_no, seq),
+            ).fetchone()
+            if existing is not None:
+                # 同一段不能出两次：原记录原样返回，时间不动
+                return self._erratum_view(existing, draft), "already_issued"
+            self._conn.execute(
+                "INSERT INTO errata(draft_no, call_id, seq, old_text, new_text,"
+                " issued_at) VALUES(?,?,?,?,?,?)",
+                (draft_no, draft["call_id"], seq, text_by_seq[seq], new_text, _now()),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM errata WHERE draft_no=? AND seq=?",
+                (draft_no, seq),
+            ).fetchone()
+            return self._erratum_view(row, draft), "issued"
+
+    def _erratum_view(self, r: sqlite3.Row, draft: dict) -> dict:
+        return {
+            # 对的是哪一稿、哪一段、当时是什么、改成什么 —— 一清二楚
+            "draft_no": r["draft_no"],
+            "call_id": r["call_id"],
+            "draft_seq": draft["draft_seq"],
+            "seq": r["seq"],
+            "old_text": r["old_text"],
+            "new_text": r["new_text"],
+            "issued_at": r["issued_at"],
+            # 当时那一稿的完整快照 —— 出勘误改不了它的正文和缺口
+            "draft": draft,
+        }
+
+    def get_errata(self, draft_no: str) -> dict | None:
+        """按稿号取这一稿出过的全部勘误（按段序）。未知稿号返回 None。"""
+        with self._lock:
+            draft = self.get_draft(draft_no)
+            if draft is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT * FROM errata WHERE draft_no=? ORDER BY seq",
+                (draft_no,),
+            ).fetchall()
+            return {
+                "draft_no": draft["draft_no"],
+                "call_id": draft["call_id"],
+                "draft_seq": draft["draft_seq"],
+                "errata": [self._erratum_view(r, draft) for r in rows],
+                # 当时那一稿的快照原样嵌着 —— 勘误碰不到它的正文和缺口
+                "draft": draft,
+            }
+
+    def list_errata(self, call_id: str) -> list[dict] | None:
+        """某通电话出过的全部勘误（按发稿顺序、段序）。查询本身带着
+        call_id，结构上列不出另一通电话的勘误 —— 两通电话的勘误不串。
+        未知 call_id 返回 None。"""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone() is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT e.* FROM errata e JOIN drafts d ON d.draft_no = e.draft_no"
+                " WHERE e.call_id=? ORDER BY d.draft_seq, e.seq",
+                (call_id,),
+            ).fetchall()
+            return [self._erratum_view(r, self.get_draft(r["draft_no"])) for r in rows]
 
     def _latest_draft_info(self, call_id: str, view: dict) -> dict | None:
         """会话视图里带的“最近一稿”摘要：稿号、发稿时间，以及活视图相对

@@ -28,10 +28,13 @@
     POST /drafts/{draft_no}/delivery/return  下游退回（200；退了之后才能再投）
     GET  /drafts/{draft_no}/delivery         这一稿投到哪了（历次投递 + 当前状态）
     GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按发稿顺序）
+    POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409）
+    GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
+    GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
     GET  /healthz                            健康检查
 
-    发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回，也不能
-    往下游投递（409）。
+    发出去的稿要先有人认领：没认领的稿不能签收、不能回放、不能撤回、不能
+    往下游投递，也不能出勘误（409）。
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Response
 
-from .models import ClaimIn, FragmentIn
+from .models import ClaimIn, ErrataIn, FragmentIn
 from .store import Store
 
 
@@ -50,7 +53,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.7.0",
+        version="1.8.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -344,6 +347,46 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if deliveries is None:
             raise HTTPException(status_code=404, detail="unknown call_id")
         return {"deliveries": deliveries}
+
+    # -------------------------------------------------------------- 勘误
+
+    @app.post("/drafts/{draft_no}/errata", status_code=201)
+    def issue_errata(draft_no: str, body: ErrataIn):
+        """按稿号对这一稿的某一段出勘误：记录带稿号、通话、第几稿、对着
+        哪一段、当时的原文和改成什么，看得出勘的是哪一稿的哪一段。
+        勘误只新增记录，不改那一稿当时的正文和缺口。没人认领的不能出；
+        撤过的稿不能出；对着的段必须在这一稿里（缺口不是段）；同一段
+        不能出两次。201；上述冲突 409；未知稿号 404。"""
+        erratum, result = store.issue_errata(draft_no, body.seq, body.new_text)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        if result == "not_claimed":
+            raise HTTPException(status_code=409, detail="draft not claimed")
+        if result == "withdrawn":
+            raise HTTPException(status_code=409, detail="draft already withdrawn")
+        if result == "unknown_seq":
+            raise HTTPException(status_code=409, detail="segment not in this draft")
+        if result == "already_issued":
+            raise HTTPException(status_code=409, detail="errata already issued for this segment")
+        return erratum
+
+    @app.get("/drafts/{draft_no}/errata")
+    def get_errata(draft_no: str):
+        """这一稿出过的全部勘误（按段序）：各自对着哪一段、当时是什么、
+        改成什么。稿快照原样嵌在里面 —— 勘误碰不到它的正文和缺口。"""
+        errata = store.get_errata(draft_no)
+        if errata is None:
+            raise HTTPException(status_code=404, detail="unknown draft_no")
+        return errata
+
+    @app.get("/sessions/{call_id}/errata")
+    def list_errata(call_id: str):
+        """该通话出过的全部勘误（按发稿顺序、段序）。查询带 call_id，
+        结构上列不出另一通电话的勘误。"""
+        errata = store.list_errata(call_id)
+        if errata is None:
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        return {"errata": errata}
 
     # -------------------------------------------------------------- 迟到片段
 

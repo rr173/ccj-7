@@ -105,6 +105,16 @@
   查（`GET /sessions/{call_id}/late-fragments`）或按稿查
   （`GET /drafts/{draft_no}/late-fragments`）都带着标识，两通电话的
   迟到记录不串；同样落 SQLite，重启后还在。
+- **发出去的稿要能出勘误**：`POST /drafts/{draft_no}/errata` 按稿号对
+  某一稿的某一段出勘误，记录带稿号、通话、第几稿、对着哪一段、当时的
+  原文和改成什么，看得出勘的是哪一稿的哪一段。勘误只往 `errata` 表
+  插行，**绝不改那一稿当时的正文和缺口**（`drafts` 仍是 INSERT-only）。
+  **没人认领的不能出**；**同一段不能出两次**（409，原记录时间不动）；
+  对着的段必须是该稿快照里真实存在的片段（缺口不是段、越界序号也不是）；
+  撤过的稿不能出，已签收、已投下游的稿照样能出。稿号自带 `call_id`，
+  拿一通的号给另一通出不了勘误，按通话列出
+  （`GET /sessions/{call_id}/errata`）也带着过滤，两通电话的勘误不串；
+  勘误记录落 SQLite，重启后出过的勘误还在。
 
 ## API
 
@@ -137,6 +147,9 @@ POST /drafts/{draft_no}/delivery/accept  下游收下（200；终态，不能再
 POST /drafts/{draft_no}/delivery/return  下游退回（200；退了之后才能再投；没在等回音 409）
 GET  /drafts/{draft_no}/delivery         这一稿投到哪了（当前状态 + 历次投递，未投过 status=none）
 GET  /sessions/{call_id}/deliveries      该通话全部稿的投递状态（按发稿顺序）
+POST /drafts/{draft_no}/errata           按稿号对某一段出勘误（201；未认领/已撤回/段不在稿里/该段已出过 409；未知稿号 404）
+GET  /drafts/{draft_no}/errata           这一稿出过的全部勘误（按段序）
+GET  /sessions/{call_id}/errata          该通话出过的全部勘误（按发稿顺序、段序）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
 ```
@@ -197,6 +210,13 @@ GET  /docs                             Swagger UI
 `accepted_at`/`returned_at`（最近一次投递的三个时刻）、`draft`（发稿当时的
 完整快照——投递流转改不了它的正文和缺口）。没人认领不能投；待回音期间不能
 再投；退了才能再投；收下是终态。投递只写 `deliveries` 表，从不修改 `drafts`。
+
+勘误（errata）关键字段：`draft_no`/`call_id`/`draft_seq`（勘的是哪一稿）、
+`seq`（对着哪一段——该稿快照里的片段序号）、`old_text`（那一稿当时该段的
+原文，随记录钉住）、`new_text`（改成什么）、`issued_at`（出勘误的时刻）、
+`draft`（当时那一稿的完整快照——勘误改不了它的正文和缺口）。没人认领不能
+出；同一段不能出两次；缺口和越界序号不是段；撤过的稿不能出。勘误只写
+`errata` 表，从不修改 `drafts`。
 
 ### 示例
 
@@ -404,6 +424,30 @@ curl localhost:8000/drafts/C1-D0001/delivery
 curl localhost:8000/sessions/C1/deliveries                    # 该通话全部稿的投递状态
 ```
 
+### 出勘误
+
+```bash
+# 没人认领的稿不能出勘误（409）；先认领
+curl -X POST localhost:8000/drafts/C1-D0001/claim \
+     -H 'Content-Type: application/json' -d '{"claimed_by":"张三"}'
+
+# 按稿号对第 2 段出勘误：看得出勘的是哪一稿、对着哪一段、改成什么
+curl -X POST localhost:8000/drafts/C1-D0001/errata \
+     -H 'Content-Type: application/json' -d '{"seq":2,"new_text":"听不清"}'
+# {"draft_no":"C1-D0001","call_id":"C1","draft_seq":1,"seq":2,
+#  "old_text":"听得到吗","new_text":"听不清","issued_at":"...",
+#  "draft":{...当时那一稿...}}
+
+# 同一段不能出两次（409，原记录时间不动）；缺口不是段，不能对着缺口出
+curl -X POST localhost:8000/drafts/C1-D0001/errata \
+     -H 'Content-Type: application/json' -d '{"seq":2,"new_text":"又改"}'   # 409
+
+# 那一稿当时的正文和缺口一个字不变；勘误单独可查
+curl localhost:8000/drafts/C1-D0001          # 正文、缺口仍是发稿时的样子
+curl localhost:8000/drafts/C1-D0001/errata   # 这一稿出过的全部勘误
+curl localhost:8000/sessions/C1/errata       # 该通话出过的全部勘误（重启后还在）
+```
+
 ## 运行
 
 ### Docker
@@ -434,7 +478,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           89 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           99 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -449,7 +493,10 @@ tests/           89 个测试：乱序、重传、通话隔离、缺口（含越
                  重启后认了谁还在），下游投递（按稿号投、看得出投的是哪稿、
                  没认领不能投、没回音不能再投、收下终态不能再退再投、退了才能
                  再投且历次留痕、投递不改正文缺口、两通电话不串、重启后投到哪
-                 了还在、与撤回互斥）
+                 了还在、与撤回互斥），勘误（按稿号对段出、看得出哪稿哪段改成
+                 什么、不改那一稿正文缺口、没认领不能出、同一段不能出两次、
+                 缺口不是段、撤过不能出、已签已投照样能出、两通电话不串、
+                 重启后勘误还在）
 Dockerfile / docker-compose.yml
 ```
 
