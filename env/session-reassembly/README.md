@@ -189,6 +189,19 @@
   下去的那通重启后照样自由。按通话列桥
   （`GET /sessions/{call_id}/bridges`）把换下去/换上来的经过也列得出：
   被换下去的条目标 `currently_on_bridge=false`，并给出它最后在桥时的左右侧。
+- **桥还搭着时，第三通已经有段的电话可以来旁观**：`POST /bridges/{桥号}
+  /observers` 让一通**非空**通话来旁观这座桥（同一通重复旁观同一座幂等，
+  开始时刻不动）。**旁观者不是桥的一边**：桥上对齐仍按原来两边现算，两边
+  再来新段，旁观者看到的也跟着变（`GET /bridges/{桥号}/observers/{call_id}`
+  就是旁观者此刻看到的现算对齐）。约束：**正在旁观的这通不能同时旁观另一座
+  （部分唯一索引兜底），也不能是这座桥上的一边**（旁观 INSERT 与换边 UPDATE
+  两个触发器双向兜底）；**空的电话不能来旁观**；**已经拆掉的桥不能再让人
+  旁观**——拆桥时正在旁观的各通一并结束旁观。**正旁观的时候，这通不能被换
+  上这座桥**：先 `POST .../observers/{call_id}/leave` 不当旁观的人，才能换
+  上来。旁观只写 `bridge_observers` 表，**不改那两通各自的会话，也不改桥上
+  此刻的对齐**；桥视图带 `observer_count`/`observers`，会话视图带
+  `observing_bridge`。旁观记录落 SQLite：**服务再起来，谁在旁观还在，对齐
+  仍按两边现在的段来算**。
 
 ## API
 
@@ -236,6 +249,11 @@ GET  /bridges/{bridge_no}/swaps          这座桥历次换边的留痕（第几
 POST /bridges/{bridge_no}/photos         桥还搭着时拍一张照（201，钉住此刻两边对到哪一对；已拆 409；未知桥号 404）
 GET  /bridges/{bridge_no}/photos         这座桥拍过的全部照片（第几张、何时拍、拍时两边与逐对对齐）
 GET  /bridges/{bridge_no}/photos/{n}     取这座桥的第 n 张照片（永远是拍时那份；没拍过/未知桥号 404）
+POST /bridges/{bridge_no}/observers      让一通已有片段的电话来旁观这座桥（201；已在这座旁观 200 幂等；
+                                         已拆/空通话/桥上两边/正旁观另一座 409；未知桥号/通话 404）
+POST /bridges/{bridge_no}/observers/{call_id}/leave  停止旁观这座桥（200；并不在旁观 409；未知桥号 404）
+GET  /bridges/{bridge_no}/observers      这座桥此刻的旁观者们（谁在旁观、从何时开始；未知桥号 404）
+GET  /bridges/{bridge_no}/observers/{call_id}  这个旁观者此刻看到的桥（按两边现在的段现算；没在旁观 404）
 GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的带 currently_on_bridge=false；未知通话 404）
 GET  /healthz                          健康检查
 GET  /docs                             Swagger UI
@@ -247,7 +265,9 @@ GET  /docs                             Swagger UI
 `retransmissions`、`conflicts`、`completed_at`、`latest_draft`
 （最近一稿的 `draft_no`/`issued_at`/`changed_since`，未发过稿为 `null`）、
 `active_bridge`（这通电话此刻还搭着的桥：`bridge_no`/`side`(left|right)/
-`other_call_id`/`created_at`，没搭桥或已拆为 `null`）。
+`other_call_id`/`created_at`，没搭桥或已拆为 `null`）、
+`observing_bridge`（这通电话此刻正在旁观的桥：`bridge_no`/`since`，
+没在旁观为 `null`）。
 
 稿（draft）关键字段：`draft_no`（稿号）、`draft_seq`（该通话第几稿）、
 `status`/`content`/`gaps`（发稿那一刻的状态、正文、缺口）、`gap_history`
@@ -328,7 +348,9 @@ GET  /docs                             Swagger UI
 第几张、`taken_at` 何时拍、拍时的 `left_call_id`/`right_call_id` 与逐对对齐
 `left`/`right`/`pairs`/`aligned_count`/`gap_count`/`total_pairs`/
 `aligned_up_to`/`gaps`——只插不改，拍完后两通再来段、换边、拆桥都碰不到旧
-照片；已拆桥不能再拍，但拆前的照片拆后仍在）。
+照片；已拆桥不能再拍，但拆前的照片拆后仍在）、
+`observer_count`/`observers`（此刻谁在旁观这座桥：每项含 `call_id`/`since`
+——旁观者不是桥的一边，拆桥时旁观一并结束，已拆桥恒为空）。
 活动桥这些对齐字段按当前两边片段**现算**；拆桥时把当时的全套值冻结进桥行，
 之后两通再收段也不变。按通话列出时每项还带 `side`（该通最后在这座桥的左边
 还是右边）与 `currently_on_bridge`（现行两边为 `true`，已被换下去为 `false`）。
@@ -699,6 +721,41 @@ curl -X POST localhost:8000/bridges/B0001/photos     # 409 bridge already disman
 curl localhost:8000/bridges/B0001/photos             # 旧照片仍在
 ```
 
+### 桥还搭着时让第三通来旁观
+
+```bash
+# B0001（A-B）还搭着：C 已有自己的片段，让它来旁观
+curl -X POST localhost:8000/bridges/B0001/observers \
+     -H 'Content-Type: application/json' -d '{"call_id":"C"}'
+# 201：{"bridge_no":"B0001","call_id":"C","since":"...",
+#       "left_call_id":"A","right_call_id":"B",
+#       "aligned_count":2,"aligned_up_to":2,"gaps":[[3,3]],"pairs":[...]}
+
+# 旁观者不是桥的一边：桥上对齐仍按 A、B 现算；B 补上第 3 段，
+# 旁观者看到的跟着变（C 自己的段不参与对齐）
+curl -X POST localhost:8000/fragments -H 'Content-Type: application/json' \
+     -d '{"call_id":"B","seq":3,"text":"b3"}'
+curl localhost:8000/bridges/B0001/observers/C
+# {"aligned_count":3,"aligned_up_to":3,"gaps":[],...}
+
+# 谁在旁观、从何时开始；C 的会话视图也标着它在看哪座桥
+curl localhost:8000/bridges/B0001/observers
+# {"observer_count":1,"observers":[{"call_id":"C","since":"..."}]}
+curl localhost:8000/sessions/C        # "observing_bridge":{"bridge_no":"B0001",...}
+
+# 正在旁观的 C 不能同时旁观另一座（409），也不能被换上这座桥（409）；
+# 先不当旁观的人，才能换上来
+curl -X POST localhost:8000/bridges/B0001/swap -H 'Content-Type: application/json' \
+     -d '{"side":"left","call_id":"C"}'            # 409 call is observing this bridge
+curl -X POST localhost:8000/bridges/B0001/observers/C/leave
+curl -X POST localhost:8000/bridges/B0001/swap -H 'Content-Type: application/json' \
+     -d '{"side":"left","call_id":"C"}'            # 201，C 换到左边
+
+# 空的电话不能来旁观（409）；桥上两边不能旁观自己的桥（409）；
+# 拆掉的桥不能再让人旁观（409）——拆桥时在旁观的各通一并结束旁观。
+# 旁观不改两通各自的会话，也不改桥上此刻的对齐；重启后谁在旁观还在。
+```
+
 ## 运行
 
 ### Docker
@@ -729,7 +786,7 @@ app/
   store.py       SQLite 持久化：写入去重、缺口对账、视图拼装
   reassembly.py  纯函数：重排、缺口检测、状态判定（便于单测）
   models.py      片段入参校验
-tests/           167 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
+tests/           186 个测试：乱序、重传、通话隔离、缺口（含越界/收缩/无结束标记
                  补齐/大空洞）、旧表迁移、重启持久化，已发稿的钉住、订正链、
                  两通电话隔离、重启后稿不丢，签收（待签钉住、按号签收、
                  不串签、不重复签、新稿不顶旧待签、重启后待签还在、老库补单），
@@ -765,7 +822,13 @@ tests/           167 个测试：乱序、重传、通话隔离、缺口（含�
                  桥拍照（搭着时能拍、钉住此刻两边对到哪一对、同一座可拍多张
                  各带第几张、拍完再来新段旧照片不变而现行对齐继续现算、拍照不
                  改两通会话也不动桥上现行对齐、已拆的桥不能再拍但拆前照片仍在、
-                 换边后旧照片不被新两边盖掉、两桥各自编号不串、重启后照片还在）
+                 换边后旧照片不被新两边盖掉、两桥各自编号不串、重启后照片还在），
+                 桥旁观（搭着时第三通有段的电话可来旁观、旁观者不是桥的一边、
+                 两边来新段旁观者看到的跟着变、旁观者自己的段不参与对齐、
+                 不能同时旁观两座/不能是这座桥上的一边/空电话不能旁观、
+                 已拆的桥不能旁观且拆桥时旁观一并结束、正旁观不能换上来先离开
+                 才能换、旁观不改两通会话也不动桥上对齐、重复旁观幂等、
+                 唯一索引+触发器双向兜底、重启后谁在旁观还在且对齐仍现算）
 Dockerfile / docker-compose.yml
 ```
 

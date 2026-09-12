@@ -43,6 +43,11 @@
     POST /bridges/{bridge_no}/photos         桥还搭着时拍一张照（钉住此刻两边对到哪一对；已拆 409）
     GET  /bridges/{bridge_no}/photos         这座桥拍过的全部照片（第几张、何时拍、拍时对齐）
     GET  /bridges/{bridge_no}/photos/{n}     这座桥的第 n 张照片（永远是拍时那份对齐）
+    POST /bridges/{bridge_no}/observers      让一通已有片段的电话来旁观这座桥（201；已在这座旁观 200；
+                                             已拆/空通话/桥上两边/正旁观另一座 409；未知 404）
+    POST /bridges/{bridge_no}/observers/{call_id}/leave  停止旁观（200；并不在旁观 409；未知桥号 404）
+    GET  /bridges/{bridge_no}/observers      这座桥此刻的旁观者们（谁在旁观、从何时开始）
+    GET  /bridges/{bridge_no}/observers/{call_id}  这个旁观者此刻看到的桥（按两边现在的段现算）
     GET  /sessions/{call_id}/bridges         该通话上过的全部桥（标明左/右；被换下去的也在）
     GET  /healthz                            健康检查
 
@@ -56,7 +61,10 @@ import os
 
 from fastapi import FastAPI, HTTPException, Response
 
-from .models import BridgeIn, BridgeSwapIn, ClaimIn, ErrataIn, FragmentIn, HoldIn
+from .models import (
+    BridgeIn, BridgeObserverIn, BridgeSwapIn, ClaimIn, ErrataIn, FragmentIn,
+    HoldIn,
+)
 from .store import Store
 
 
@@ -68,7 +76,7 @@ def create_app(
 
     app = FastAPI(
         title="通话片段拼接服务",
-        version="1.12.0",
+        version="1.13.0",
         description="把同一条链路上乱序、带重传的通话片段拼回完整会话。",
     )
     app.state.store = store
@@ -539,7 +547,8 @@ def create_app(
 
         桥号不变，换完按新的两边重新对齐；被换下去的那通恢复自由（可再搭
         新桥）。换上来的不能是空通话（409）、不能已经在别的活动桥里（409）、
-        也不能就是这座桥当前两边中的一通（409）；已拆掉的桥不能再换边（409）；
+        也不能就是这座桥当前两边中的一通（409）；正旁观这座桥的也不能换上来
+        （409，先不当旁观的人才能换）；已拆掉的桥不能再换边（409）；
         未知桥号 404、未知通话 404。每次换边旧两边是谁、旧对齐到哪都单独
         留痕（GET /bridges/{桥号}/swaps），不被新两边盖掉。
         """
@@ -560,6 +569,10 @@ def create_app(
         if result == "already_bridged":
             raise HTTPException(
                 status_code=409, detail="call already in an active bridge"
+            )
+        if result == "observing":
+            raise HTTPException(
+                status_code=409, detail="call is observing this bridge"
             )
         return bridge
 
@@ -613,6 +626,72 @@ def create_app(
         if photo is None:
             raise HTTPException(status_code=404, detail="unknown bridge photo")
         return photo
+
+    # -------------------------------------------------------------- 桥旁观
+
+    @app.post("/bridges/{bridge_no}/observers")
+    def observe_bridge(bridge_no: str, body: BridgeObserverIn, response: Response):
+        """让一通已经有片段的电话来旁观这座还搭着的桥。
+
+        旁观者不是桥的一边：桥上对齐仍按原来两边现算，两边再来新段，旁观者
+        看到的也跟着变。同一通不能同时旁观两座桥，也不能是这座桥上的一边；
+        空的电话不能来旁观；已经拆掉的桥不能再让人旁观。同一通重复旁观同一
+        座幂等（200，开始时刻不动）。旁观不改那两通各自的会话，也不改桥上
+        此刻的对齐。首次旁观 201；上述冲突 409；未知桥号/通话 404。
+        """
+        obs, result = store.observe_bridge(bridge_no, body.call_id)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        if result == "dismantled":
+            raise HTTPException(status_code=409, detail="bridge already dismantled")
+        if result == "unknown_call":
+            raise HTTPException(status_code=404, detail="unknown call_id")
+        if result == "empty":
+            raise HTTPException(status_code=409, detail="call has no fragments")
+        if result == "side_of_bridge":
+            raise HTTPException(
+                status_code=409, detail="call is a side of this bridge"
+            )
+        if result == "already_observing":
+            raise HTTPException(
+                status_code=409, detail="call already observing another bridge"
+            )
+        response.status_code = 201 if result == "observing" else 200
+        return obs
+
+    @app.post("/bridges/{bridge_no}/observers/{call_id}/leave")
+    def leave_bridge_observation(bridge_no: str, call_id: str):
+        """停止旁观这座桥。正旁观着的这通不能被换上这座桥 —— 先不当旁观
+        的人，才能换上来。停止只填旁观记录的 left_at：两通的会话、桥上
+        此刻的对齐都碰不到。200；这通此刻并不在旁观这座桥 409；
+        未知桥号 404。"""
+        obs, result = store.leave_bridge_observation(bridge_no, call_id)
+        if result == "unknown":
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        if result == "not_observing":
+            raise HTTPException(
+                status_code=409, detail="call is not observing this bridge"
+            )
+        return obs
+
+    @app.get("/bridges/{bridge_no}/observers")
+    def list_bridge_observers(bridge_no: str):
+        """这座桥此刻的旁观者们（按开始旁观先后）：谁在旁观、从何时开始。
+        旁观记录落 SQLite，重启后谁在旁观还在。未知桥号 404。"""
+        observers = store.list_bridge_observers(bridge_no)
+        if observers is None:
+            raise HTTPException(status_code=404, detail="unknown bridge_no")
+        return observers
+
+    @app.get("/bridges/{bridge_no}/observers/{call_id}")
+    def get_bridge_observer(bridge_no: str, call_id: str):
+        """这个旁观者此刻看到的桥：桥上两边身份 + 按两边现在的段现算的
+        逐对对齐 —— 两边再来新段，这里看到的跟着变。桥号未知、或这通此刻
+        并不在旁观这座桥，404。"""
+        obs = store.get_bridge_observer(bridge_no, call_id)
+        if obs is None:
+            raise HTTPException(status_code=404, detail="unknown bridge observer")
+        return obs
 
     @app.get("/sessions/{call_id}/bridges")
     def list_bridges_for_call(call_id: str):

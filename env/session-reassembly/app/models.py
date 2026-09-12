@@ -65,6 +65,23 @@ class BridgeSwapIn(BaseModel):
     )
 
 
+class BridgeObserverIn(BaseModel):
+    """让一通**已经有片段**的电话来旁观一座还搭着的桥。
+
+    - call_id   ：来旁观的是哪通电话 —— 必须非空（已有片段）、不能是这座桥
+                  上的一边、也不能正在旁观另一座桥；
+    - 旁观者不是桥的一边：桥上对齐仍按原来两边现算，两边再来新段，旁观者
+      看到的也跟着变。已经拆掉的桥不能再让人旁观。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    call_id: str = Field(
+        min_length=1, max_length=256,
+        validation_alias=AliasChoices("call_id", "observer", "observer_call_id"),
+    )
+
+
 class ClaimIn(BaseModel):
     """认领一稿：认领人标识。稿一旦被人认领，别人不能再认走，
     直到当前认领人把它交出去（release）。"""

@@ -3,8 +3,8 @@
 所有会话状态都落在 SQLite（WAL + synchronous=FULL）里，读取时由 fragments
 表现算视图，因此服务重启后正在拼接的会话原样还在，不会散。
 
-十五张表（前十一张业务表 + holds 压稿表 + bridges 桥表 + bridge_swaps 换边留痕表 +
-bridge_photos 桥拍照留痕表）：
+十六张表（前十一张业务表 + holds 压稿表 + bridges 桥表 + bridge_swaps 换边留痕表 +
+bridge_photos 桥拍照留痕表 + bridge_observers 桥旁观表）：
 - fragments  : 已收到的片段，(call_id, seq) 主键 —— 重传天然去重
 - calls      : 每个 call_id 的元信息（结束序号、完成时间、冲突计数）
 - gap_events : 缺口历史，按**区间**记录（seq_lo..seq_hi）。缺口出现/扩大时
@@ -117,6 +117,17 @@ bridge_photos 桥拍照留痕表）：
                **已经拆掉的桥不能再拍**（拍照只对 active 的桥开放；拆时冻结对齐
                另有 bridges.snapshot_json 留痕），但拆前拍过的照片拆后照样可查、
                仍是拍时那份。照片落 SQLite，服务再起来拍过的还在，活动桥的现行
+               对齐仍按两边现在的段来算。
+- bridge_observers : 桥的旁观记录 —— 桥还搭着时，可以让**已经有片段**的第三通
+               电话来旁观：旁观者不是桥的一边，桥上对齐仍按原来两边现算，两边
+               再来新段，旁观者看到的也跟着变。一行一段旁观（since 开始、
+               left_at 停止，NULL = 正在旁观）。同一通电话同一时刻至多旁观
+               一座桥（部分唯一索引兜底），也不能是这座桥上的一边（旁观 INSERT
+               与换边 UPDATE 两个触发器双向兜底）；空的通话不能来旁观；**已经
+               拆掉的桥不能再让人旁观** —— 拆桥时把当时在旁观的各通一并填上
+               left_at。正旁观着的这通不能被换上这座桥：先不当旁观的人，才能
+               换上来。旁观只写本表，绝不碰两通各自的 fragments/calls，也不碰
+               桥上此刻还在算的对齐。记录落 SQLite：服务再起来，谁在旁观还在，
                对齐仍按两边现在的段来算。
 """
 
@@ -337,6 +348,44 @@ CREATE TABLE IF NOT EXISTS bridge_photos (
     UNIQUE (bridge_no, photo_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_bridge_photos_no ON bridge_photos(bridge_no);
+-- 桥旁观记录：一行一段旁观（since 开始、left_at 停止，NULL = 正在旁观）。
+-- 只有还搭着的桥能被旁观；旁观者必须是非空通话、不能是这座桥上的一边。
+-- 旁观只写本表：两通各自的会话、桥上此刻还在算的对齐都不受影响。
+CREATE TABLE IF NOT EXISTS bridge_observers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 旁观先后（全局顺序）
+    bridge_no   TEXT NOT NULL REFERENCES bridges(bridge_no),  -- 旁观的是哪座桥
+    call_id     TEXT NOT NULL,      -- 哪通电话在旁观（非空、不是桥上两边）
+    since       TEXT NOT NULL,      -- 开始旁观的时刻
+    left_at     TEXT                -- NULL = 正在旁观；停止旁观（或桥被拆）的时刻
+);
+-- 同一通电话同一时刻至多旁观一座桥；同一座桥里同一通至多一条进行中的旁观。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_observers_active_call
+    ON bridge_observers(call_id) WHERE left_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_observers_active_pair
+    ON bridge_observers(bridge_no, call_id) WHERE left_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_bridge_observers_no ON bridge_observers(bridge_no);
+-- “旁观者不能是这座桥上的一边”双向兜底：旁观 INSERT 时桥须搭着且这通不是
+-- 桥上两边；换边 UPDATE 时正旁观这座桥的不能被换上来。
+CREATE TRIGGER IF NOT EXISTS trg_bridge_observers_insert
+BEFORE INSERT ON bridge_observers
+WHEN NEW.left_at IS NULL
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM bridges WHERE bridge_no=NEW.bridge_no
+          AND (status<>'active'
+               OR left_call_id=NEW.call_id OR right_call_id=NEW.call_id)
+    ) THEN RAISE(ABORT, 'cannot observe this bridge') END;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_bridges_swap_not_observer
+BEFORE UPDATE OF left_call_id, right_call_id ON bridges
+WHEN NEW.status='active'
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM bridge_observers
+        WHERE left_at IS NULL AND bridge_no=NEW.bridge_no
+          AND call_id IN (NEW.left_call_id, NEW.right_call_id)
+    ) THEN RAISE(ABORT, 'observer cannot become a side of this bridge') END;
+END;
 """
 
 # 旧版 gap_events 按“每个缺失序号一行”（call_id, seq）存储。一次性迁移成区间表。
@@ -1818,6 +1867,11 @@ class Store:
         # 桥已拆也好，这里带出的永远是各张照片自己拍时那份冻结的对齐
         view["photo_count"] = len(photos)
         view["photos"] = [self._photo_view(p) for p in photos]
+        observers = self._observer_rows(r["bridge_no"])
+        # 此刻谁在旁观这座桥：旁观者不是桥的一边，对齐仍按两边现算；拆桥时
+        # 旁观一并结束，已拆桥这里恒为空
+        view["observer_count"] = len(observers)
+        view["observers"] = [self._observer_view(o) for o in observers]
         return view
 
     def create_bridge(
@@ -1899,6 +1953,13 @@ class Store:
                 (BR_DISMANTLED, now,
                  json.dumps(live, ensure_ascii=False), bridge_no),
             )
+            # 已经拆掉的桥不能再让人旁观：正在旁观这座桥的各通一并结束旁观
+            # （只填 left_at，记录留着）
+            self._conn.execute(
+                "UPDATE bridge_observers SET left_at=?"
+                " WHERE bridge_no=? AND left_at IS NULL",
+                (now, bridge_no),
+            )
             row = self._conn.execute(
                 "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
             ).fetchone()
@@ -1919,7 +1980,9 @@ class Store:
         - ``"already_on_bridge"``：换上来的就是这座桥当前两边中的一通
           （原地不动 / 自己跟自己搭都不行）；
         - ``"already_bridged"``：换上来的通话此刻已在另一座活动桥里 ——
-          同一通不能同时待在两座桥里。
+          同一通不能同时待在两座桥里；
+        - ``"observing"``：换上来的通话此刻正在旁观这座桥 —— 先不当旁观
+          的人，才能换上来。
 
         换边只做两件事：先把**旧两边**当时的身份与逐对对齐整体快照，连同
         “第几次换、换哪边、谁下谁上、另一边是谁”INSERT 进 bridge_swaps
@@ -1959,6 +2022,14 @@ class Store:
             if self._active_bridge_row(new_call_id) is not None:
                 # 同一通电话不能同时待在两座桥里；触发器/索引同样兜底
                 return self._bridge_view(r), "already_bridged"
+            observing = self._conn.execute(
+                "SELECT 1 FROM bridge_observers WHERE bridge_no=? AND call_id=?"
+                " AND left_at IS NULL",
+                (bridge_no, new_call_id),
+            ).fetchone()
+            if observing is not None:
+                # 正旁观这座桥的不能换上来：先不当旁观的人，才能换上来
+                return self._bridge_view(r), "observing"
 
             old_call_id = (
                 r["left_call_id"] if side == SIDE_LEFT else r["right_call_id"]
@@ -1990,11 +2061,18 @@ class Store:
                     (new_call_id, bridge_no),
                 )
             except sqlite3.IntegrityError:
-                # 触发器/唯一索引兜底：并发下换上来的通话刚进了别的活动桥。
-                # 整笔回滚 —— 上面那笔留痕 INSERT 一起撤掉：桥没换成，
-                # 历史里就不能留下“换过”的这一笔（否则它会随库持久化，
-                # 重启后还在）。
+                # 触发器/唯一索引兜底：并发下换上来的通话刚进了别的活动桥，
+                # 或刚在旁观这座桥。整笔回滚 —— 上面那笔留痕 INSERT 一起撤掉：
+                # 桥没换成，历史里就不能留下“换过”的这一笔（否则它会随库
+                # 持久化，重启后还在）。
                 self._conn.rollback()
+                obs = self._conn.execute(
+                    "SELECT 1 FROM bridge_observers WHERE bridge_no=? AND call_id=?"
+                    " AND left_at IS NULL",
+                    (bridge_no, new_call_id),
+                ).fetchone()
+                if obs is not None:
+                    return None, "observing"
                 return None, "already_bridged"
             row = self._conn.execute(
                 "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
@@ -2121,6 +2199,198 @@ class Store:
                 "photo_count": len(rows),
                 "photos": [self._photo_view(r) for r in rows],
             }
+
+    # ------------------------------------------------------------ 桥旁观
+
+    def _observer_rows(self, bridge_no: str) -> list[sqlite3.Row]:
+        """这座桥此刻正在旁观的记录（left_at 为 NULL），按开始旁观先后。"""
+        return self._conn.execute(
+            "SELECT * FROM bridge_observers WHERE bridge_no=? AND left_at IS NULL"
+            " ORDER BY id",
+            (bridge_no,),
+        ).fetchall()
+
+    def _observing_row_for_call(self, call_id: str) -> sqlite3.Row | None:
+        """这通电话此刻正在旁观的那一条（同一通同一时刻至多旁观一座桥），
+        没有返回 None。"""
+        return self._conn.execute(
+            "SELECT * FROM bridge_observers WHERE call_id=? AND left_at IS NULL",
+            (call_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _observer_view(r: sqlite3.Row) -> dict:
+        """一条进行中的旁观：谁在旁观哪座桥、从何时开始。"""
+        return {
+            "bridge_no": r["bridge_no"],
+            "call_id": r["call_id"],
+            "since": r["since"],
+        }
+
+    def _observer_live_view(self, obs: sqlite3.Row, bridge: sqlite3.Row) -> dict:
+        """旁观者此刻看到的桥：身份 + 按桥上两边现在的段**现算**的对齐。
+
+        旁观者不是桥的一边 —— 对齐只按桥上两边的片段现算，两边再来新段，
+        这里看到的就跟着变；旁观者自己的段不参与对齐。
+        """
+        view = {
+            "bridge_no": obs["bridge_no"],
+            "call_id": obs["call_id"],
+            "since": obs["since"],
+            "left_call_id": bridge["left_call_id"],
+            "right_call_id": bridge["right_call_id"],
+        }
+        view.update(
+            self._compute_alignment(bridge["left_call_id"], bridge["right_call_id"])
+        )
+        return view
+
+    def observe_bridge(self, bridge_no: str, call_id: str) -> tuple[dict | None, str]:
+        """让一通已经有片段的电话来旁观一座还搭着的桥，返回 (旁观视图, 结果)。
+        结果为：
+
+        - ``"observing"``：本次开始旁观；
+        - ``"already_here"``：这通本就在旁观这座桥 —— 幂等，开始时刻不动；
+        - ``"unknown"``：桥号不存在，视图为 None；
+        - ``"dismantled"``：桥已经拆了 —— 已经拆掉的桥不能再让人旁观；
+        - ``"unknown_call"``：这通电话不存在；
+        - ``"empty"``：这通电话一个片段都没有 —— 空的不能来旁观；
+        - ``"side_of_bridge"``：这通就是这座桥上的一边 —— 旁观者不能是桥上
+          的一边；
+        - ``"already_observing"``：这通正在旁观另一座桥 —— 同一通不能同时
+          旁观两座。
+
+        旁观只往 bridge_observers 插一行：不写不改任何 fragments/calls，桥上
+        此刻还在算的对齐也不动 —— 旁观者不是桥的一边，对齐仍按原来两边现算。
+        """
+        with self._lock, self._conn:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if r is None:
+                return None, "unknown"
+            if r["status"] == BR_DISMANTLED:
+                # 已拆的桥不能再让人旁观：不产生任何旁观记录
+                return None, "dismantled"
+            call = self._conn.execute(
+                "SELECT 1 FROM calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+            if call is None:
+                return None, "unknown_call"
+            n = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM fragments WHERE call_id=?", (call_id,)
+            ).fetchone()["n"]
+            if n == 0:
+                # 空的电话不能来旁观：一个片段都没有，谈不上看对齐
+                return None, "empty"
+            if call_id in (r["left_call_id"], r["right_call_id"]):
+                # 旁观者不能是这座桥上的一边
+                return None, "side_of_bridge"
+            cur = self._observing_row_for_call(call_id)
+            if cur is not None:
+                if cur["bridge_no"] == bridge_no:
+                    # 本就在旁观这座桥：幂等，开始时刻不动
+                    return self._observer_live_view(cur, r), "already_here"
+                # 正在旁观另一座：同一通不能同时旁观两座桥
+                return None, "already_observing"
+            try:
+                self._conn.execute(
+                    "INSERT INTO bridge_observers(bridge_no, call_id, since)"
+                    " VALUES(?,?,?)",
+                    (bridge_no, call_id, self._now()),
+                )
+            except sqlite3.IntegrityError:
+                # 唯一索引/触发器兜底：并发下这通刚去旁观了别的桥、刚被换上
+                # 这座桥，或桥刚被拆。整笔回滚，按现状给出对应结果。
+                self._conn.rollback()
+                r = self._conn.execute(
+                    "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+                ).fetchone()
+                if r is None:
+                    return None, "unknown"
+                if r["status"] == BR_DISMANTLED:
+                    return None, "dismantled"
+                if call_id in (r["left_call_id"], r["right_call_id"]):
+                    return None, "side_of_bridge"
+                return None, "already_observing"
+            row = self._conn.execute(
+                "SELECT * FROM bridge_observers WHERE bridge_no=? AND call_id=?"
+                " AND left_at IS NULL",
+                (bridge_no, call_id),
+            ).fetchone()
+            return self._observer_live_view(row, r), "observing"
+
+    def leave_bridge_observation(
+        self, bridge_no: str, call_id: str
+    ) -> tuple[dict | None, str]:
+        """停止旁观一座桥，返回 (结束的旁观记录, 结果)。结果为：
+
+        - ``"left"``：本次停止旁观（left_at 只写一次）；
+        - ``"not_observing"``：这通此刻并不在旁观这座桥；
+        - ``"unknown"``：桥号不存在，记录为 None。
+
+        只填自己那行的 left_at：两通的会话、桥上此刻的对齐都碰不到。先不当
+        旁观的人，之后才能被换上这座桥。
+        """
+        with self._lock, self._conn:
+            exists = self._conn.execute(
+                "SELECT 1 FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if exists is None:
+                return None, "unknown"
+            now = self._now()
+            cur = self._conn.execute(
+                "UPDATE bridge_observers SET left_at=?"
+                " WHERE bridge_no=? AND call_id=? AND left_at IS NULL",
+                (now, bridge_no, call_id),
+            )
+            if cur.rowcount == 0:
+                return None, "not_observing"
+            row = self._conn.execute(
+                "SELECT * FROM bridge_observers WHERE bridge_no=? AND call_id=?"
+                " ORDER BY id DESC LIMIT 1",
+                (bridge_no, call_id),
+            ).fetchone()
+            return {
+                "bridge_no": row["bridge_no"],
+                "call_id": row["call_id"],
+                "since": row["since"],
+                "left_at": row["left_at"],
+            }, "left"
+
+    def list_bridge_observers(self, bridge_no: str) -> dict | None:
+        """这座桥此刻的旁观者们（按开始旁观先后）：谁在旁观、从何时开始。
+        未知桥号返回 None。"""
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = self._observer_rows(bridge_no)
+            return {
+                "bridge_no": bridge_no,
+                "observer_count": len(rows),
+                "observers": [self._observer_view(r) for r in rows],
+            }
+
+    def get_bridge_observer(self, bridge_no: str, call_id: str) -> dict | None:
+        """某个旁观者此刻看到的桥：身份 + 按桥上两边现在的段现算的对齐。
+        桥号未知、或这通此刻并不在旁观这座桥，都返回 None。"""
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM bridges WHERE bridge_no=?", (bridge_no,)
+            ).fetchone()
+            if r is None:
+                return None
+            obs = self._conn.execute(
+                "SELECT * FROM bridge_observers WHERE bridge_no=? AND call_id=?"
+                " AND left_at IS NULL",
+                (bridge_no, call_id),
+            ).fetchone()
+            if obs is None:
+                return None
+            return self._observer_live_view(obs, r)
 
     def get_bridge(self, bridge_no: str) -> dict | None:
         """按桥号取一座桥。活动桥对齐现算；已拆桥返回拆桥时的冻结快照。
@@ -2297,6 +2567,13 @@ class Store:
                     else active["left_call_id"]
                 ),
                 "created_at": active["created_at"],
+            }
+            # 这通电话此刻正在旁观的桥（同一通同一时刻至多旁观一座）；旁观
+            # 不改会话本身，只是视图里标明它在看哪座桥、从何时开始。
+            observing = self._observing_row_for_call(call_id)
+            view["observing_bridge"] = None if observing is None else {
+                "bridge_no": observing["bridge_no"],
+                "since": observing["since"],
             }
             return view
 
